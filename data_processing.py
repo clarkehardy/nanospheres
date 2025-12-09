@@ -1,8 +1,10 @@
+from zlib import Z_BEST_COMPRESSION
 import h5py
 import numpy as np
 from glob import glob
 from pathlib import Path
 import gc
+import warnings
 
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -10,8 +12,9 @@ from matplotlib.backends.backend_pdf import PdfPages
 import scipy.signal as sig
 from scipy.optimize import curve_fit
 from scipy.special import voigt_profile
+from scipy.integrate import trapezoid
 
-def abs_susc2(omega, A, omega_0, gamma):#, C):
+def abs_susc2(omega, A, omega_0, gamma):
     """Magnitude of the mechanical susceptibility of the trapped nanosphere squared.
 
     :param omega: array of angular frequencies
@@ -25,12 +28,9 @@ def abs_susc2(omega, A, omega_0, gamma):#, C):
     :return: squared magnitude of the susceptibility of the trapped nanosphere at each angular frequency
     :rtype: numpy.ndarray
     """
-    if (gamma < 0):# or (C < 0):
+    if (gamma < 0) or (A < 0):
         return -np.inf
-    return A**2*np.abs(1/(omega_0**2 - omega**2 - 1j*gamma*omega))**2# + C**2
-
-def voigt_scaled(omega, A, omega_0, gamma, sigma, C=1.5e-12):
-    return np.abs(A)*voigt_profile(omega - omega_0, gamma, sigma) + np.abs(C)
+    return A**2*np.abs(1/(omega_0**2 - omega**2 - 1j*gamma*omega))**2
 
 def susc(omega, A, omega_0, gamma):
     """Complex mechanical susceptibility of the trapped nanosphere.
@@ -71,9 +71,11 @@ class NanoFile:
         self.pulse_amp_V = float(file_path.split('v_')[0].split('_')[-1])
         self.f_cutoff = f_cutoff
         self.t_window = t_window
+        self.search_window = 5e-4 # search in a 50 us window
+        self.noise_floor = 0.
+        self.window_func = lambda N: sig.windows.hann(N) #sig.windows.tukey(N, 0.05)
         # pulse height is undefined until the calibration is done
-        self.pulse_amp_keV = np.empty(100)
-        self.pulse_amp_keV[:] = np.nan 
+        self.pulse_amp_keV = 0.
         self.verbose = verbose
 
     def calibrate_pulse_amp(self, pulse_amps_1e, pulse_amps_V):
@@ -86,7 +88,7 @@ class NanoFile:
         """
         self.pulse_amp_keV = pulse_amps_1e[np.argmin(np.abs(pulse_amps_V - self.pulse_amp_V))]*self.n_charges
 
-    def get_force_array(self, file_num=0, pdfs=None, impulse_thresh=1., params=None):
+    def get_force_array(self, file_num=0, pdfs=None, impulse_thresh=1., params=None, noise=False, search=True):
         """Computes the force at each impulse in the data and returns the results in an array.
 
         :param file_num: file number, defaults to 0
@@ -98,26 +100,27 @@ class NanoFile:
         :param params: parameters defining the resonance, defaults to None
         :type params: list, optional
         """
-        if pdfs:
-            pulses_pdf, res_pdf, imp_pdf, spectra_pdf, time_pdf = pdfs
-        else:
-            pulses_pdf, res_pdf, imp_pdf, spectra_pdf, time_pdf = None, None, None
+        time_domain_pdf, freq_domain_pdf, optimal_filter_pdf, res_fit_pdf, impulse_win_pdf, spectra_pdf, time_pdf = pdfs
         self.load_file(file_num=file_num, pdf=spectra_pdf)
         impulse_inds = self.get_impulse_inds(file_num=file_num, pdf=time_pdf, impulse_thresh=impulse_thresh)
+        if noise:
+            impulse_inds = self.get_noise_inds(impulse_inds)
         forces = []
         resonance_params = []
         for i, ind in enumerate(impulse_inds):
             if self.verbose:
-                print('-> Computing force for impulse at t={:.5f} seconds...'.format(self.times[ind]))
-            times_win, z_raw_win, z_filt_win = self.get_impulse_window(ind, file_num, i, imp_pdf)
+                print('\t-> Computing force for impulse at t={:.5f} seconds...'.format(self.times[ind]))
+            times_win, z_raw_win, z_filt_win = self.get_impulse_window(ind, file_num, i, impulse_win_pdf)
             if params is None:
-                p, success = self.fit_susceptibility(z_filt_win, file_num, i, res_pdf)
+                p, success = self.fit_susceptibility(z_filt_win, file_num, i, res_fit_pdf)
                 if not success:
+                    print(f'Fit for impulse {i + 1} failed! Skipping')
                     continue
                 resonance_params.append(p)
-                forces.append(self.compute_force(p, times_win, z_filt_win, file_num, i, pulses_pdf))
+                forces.append(self.compute_force(p, times_win, z_filt_win, file_num, i, time_domain_pdf, \
+                              freq_domain_pdf, optimal_filter_pdf, search))
             else:
-                forces.append(self.compute_force(params, times_win, z_filt_win, file_num, i, False))
+                forces.append(self.compute_force(params, times_win, z_filt_win, file_num, i, False, search))
         
         self.resonance_params = np.array(resonance_params)
         self.forces = np.array(forces)
@@ -141,27 +144,37 @@ class NanoFile:
             self.t_int = self.n_samp/self.f_samp
             self.times = np.arange(0, self.t_int, 1/self.f_samp)
 
-            bandpass = sig.butter(3, [self.f_cutoff[0], 2*self.f_cutoff[1]], btype='bandpass', output='sos', fs=self.f_samp)
-            self.z_filtered = sig.sosfiltfilt(bandpass, self.z_raw)
+            self.bandpass = sig.butter(3, [self.f_cutoff[0], self.f_cutoff[1]], btype='bandpass', \
+                                       output='sos', fs=self.f_samp)
+            self.z_filtered = sig.sosfiltfilt(self.bandpass, self.z_raw)
 
             self.freqs, Pxx_z_raw = sig.welch(self.z_raw, fs=self.f_samp, noverlap=0, nperseg=self.f_samp*0.01)
             _, Pxx_z_filt = sig.welch(self.z_filtered, fs=self.f_samp, noverlap=0, nperseg=self.f_samp*0.01)
             _, Pxx_mon_raw = sig.welch(self.mon_raw, fs=self.f_samp, noverlap=0, nperseg=self.f_samp*0.01)
 
+            noise_int = np.sqrt(trapezoid(Pxx_z_filt, self.freqs))
+
             p = self.fit_voigt_profile(Pxx_z_raw)
+
+            impr_win = 1.5*p[1]/2./np.pi + np.array((0, 1e4))
+            impr_inds = [np.argmin(np.abs(n - self.freqs)) for n in impr_win]
+            self.noise_floor = np.mean(Pxx_z_raw[impr_inds[0]:impr_inds[1]])
+
+            self.gamma = p[-1]
+            self.omega_0 = p[1]
 
             if pdf:
                 fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
                 ax.semilogy(self.freqs*1e-3, Pxx_z_raw, alpha=1.0, label='$z$ raw')
                 ax.semilogy(self.freqs*1e-3, Pxx_z_filt, alpha=0.5, label='$z$ filtered')
-                ax.semilogy(self.freqs*1e-3, p[0]*voigt_profile(2*np.pi*self.freqs - p[1], p[2], p[3]) + p[4], alpha=0.5, label='Voigt fit')
+                ax.semilogy(self.freqs*1e-3, p[0]*voigt_profile(2*np.pi*self.freqs - p[1], p[2], p[3]) \
+                            + self.noise_floor, alpha=0.5, label='Voigt fit')
                 ax.semilogy(self.freqs*1e-3, Pxx_mon_raw, alpha=1.0, label='Monitoring raw')
-                ax.set_title('File {}'.format(file_num + 1))
+                ax.set_title('{:.0f} keV impulse, file {}'.format(self.pulse_amp_keV, file_num + 1))
                 ax.set_xlabel('Frequency [kHz]')
                 ax.set_ylabel(r'PSD [$\mathrm{V^2/Hz}$]')
-                ax.text(21, 1e-6, 'Test 1')
-                ax.set_ylim([1e-14, 1e-4])
-                ax.set_xlim([20, 40])
+                ax.set_ylim([1e-16, 1e-4])
+                ax.set_xlim([10, 100])
                 ax.legend(loc='upper right')
                 ax.grid(which='both')
                 pdf.savefig(fig, dpi=150)
@@ -171,28 +184,30 @@ class NanoFile:
                 gc.collect()
 
     def fit_voigt_profile(self, Pxx_z_filt):
-        f_0_range = [27.5e3, 32.5e3]
+        """Fits a Voigt profile to the spectrum for a full file.
+
+        :param Pxx_z_filt: the filtered PSD for the file
+        :type Pxx_z_filt: numpy.ndarray
+        :return: the best fit parameters
+        :rtype: numpy.ndarray
+        """
+        f_0_range = [20e3, 100e3]
         f_0_inds = [np.argmin(np.abs(self.freqs - f)) for f in f_0_range]
+
         omega_0_guess = 2*np.pi*self.freqs[f_0_inds[0] + np.argmax(Pxx_z_filt[f_0_inds[0]:f_0_inds[1]])]
-        gamma_guess = 2*np.pi*0.3
+        gamma_guess = 2*np.pi*1e-1
         sigma_guess = 2*np.pi*1e2
-        A_guess = 1e-3 #np.amax(Pxx_z_filt)*gamma_guess**2*omega_0_guess**2
-        C_guess = 1.5e-12
+        A_guess = 5e-3
         p0 = [A_guess, omega_0_guess, sigma_guess, gamma_guess]
 
-        fit_bw = 2*np.pi*5e3
-        fit_inds = (self.freqs > omega_0_guess - fit_bw/2.) & (self.freqs < omega_0_guess + fit_bw/2.)
+        fit_bw = 2*np.pi*2e4
+        fit_inds = (2*np.pi*self.freqs > omega_0_guess - fit_bw/2.) & (2*np.pi*self.freqs < omega_0_guess + fit_bw/2.)
 
-        voigt_scaled = lambda omega, A, omega_0, sigma, gamma, C: np.abs(A)*voigt_profile(omega - omega_0, sigma, gamma) + np.abs(C)
+        voigt_scaled = lambda omega, A, omega_0, sigma, gamma: np.log(np.abs(A)*voigt_profile(omega - omega_0, sigma, gamma))
         try:
-            p, _ = curve_fit(voigt_scaled, 2*np.pi*self.freqs[fit_inds], Pxx_z_filt[fit_inds], p0=p0, \
-                             bounds=((0, 2*np.pi*f_0_range[0], 0, 0, 0), (np.inf, 2*np.pi*f_0_range[1], np.inf, np.inf, np.inf)), \
-                             sigma=0.1*np.sqrt(Pxx_z_filt[fit_inds]))
-            print('Fit succeeded')
-            print(p)
+            p, _ = curve_fit(voigt_scaled, 2*np.pi*self.freqs[fit_inds], np.log(Pxx_z_filt[fit_inds]), p0=p0)
         except:
-            print('Fit failed')
-            print(p0)
+            print('Voigt profile fit failed!')
             return p0
 
         return p
@@ -200,7 +215,7 @@ class NanoFile:
     def integrate_noise(self):
         pass
 
-    def get_impulse_inds(self, impulse_thresh=1., file_num=None, pdf=None):
+    def get_impulse_inds(self, impulse_thresh=0.5, file_num=None, pdf=None):
         """Gets the indices in the time series data at which impulses were applied.
 
         :param impulse_thresh: threshold in volts, defaults to 1.
@@ -220,7 +235,7 @@ class NanoFile:
             ax.plot(self.times, self.imp_raw)
             ax.set_ylabel('Impulse [V]')
             ax.set_xlabel('Time [s]')
-            ax.set_title('File {}'.format(file_num + 1))
+            ax.set_title('{:.0f} keV impulse, file {}'.format(self.pulse_amp_keV, file_num + 1))
             ax.plot(self.times[impulse_inds], self.imp_raw[impulse_inds], ls='none', marker='.')
             ax.grid(which='both')
             pdf.savefig(fig, dpi=150)
@@ -230,6 +245,16 @@ class NanoFile:
             gc.collect()
 
         return impulse_inds
+
+    def get_noise_inds(self, impulse_inds):
+        """Gets a set of indices in the time series data between impulses.
+
+        :param impulse_inds: indices of impulses that were applied.
+        :type impulse inds: numpy.ndarray
+        :return: a list of indices
+        :rtype: numpy.ndarray
+        """
+        return impulse_inds - int(0.01*np.mean(np.diff(impulse_inds)))
 
     def get_impulse_window(self, impulse_ind, file_num=None, impulse_num=None, pdf=None):
         """Gets the time window around an impulse.
@@ -246,17 +271,29 @@ class NanoFile:
         :rtype: tuple
         """
         t_win_pm = int(self.t_window*self.n_samp/self.t_int)
-        times_win = self.times[impulse_ind - t_win_pm:impulse_ind + t_win_pm]
-        z_raw_win = self.z_raw[impulse_ind - t_win_pm:impulse_ind + t_win_pm]
-        z_filt_win = self.z_filtered[impulse_ind - t_win_pm:impulse_ind + t_win_pm]
+
+        # if the impulse is within the time window of the start/end of the file,
+        # wrap around and pad with noise data from the other end
+        if impulse_ind - t_win_pm < 0:
+            times_win = np.concat((self.times[impulse_ind - t_win_pm:], self.times[:impulse_ind + t_win_pm]))
+            z_raw_win = np.concat((self.z_raw[impulse_ind - t_win_pm:], self.z_raw[:impulse_ind + t_win_pm]))
+            z_filt_win = np.concat((self.z_filtered[impulse_ind - t_win_pm:], self.z_filtered[:impulse_ind + t_win_pm]))
+        elif impulse_ind + t_win_pm > len(self.times):
+            times_win = np.concat((self.times[impulse_ind - t_win_pm:], self.times[:t_win_pm - impulse_ind]))
+            z_raw_win = np.concat((self.z_raw[impulse_ind - t_win_pm:], self.z_raw[:t_win_pm - impulse_ind]))
+            z_filt_win = np.concat((self.z_filtered[impulse_ind - t_win_pm:], self.z_filtered[:t_win_pm - impulse_ind]))
+        else:
+            times_win = self.times[impulse_ind - t_win_pm:impulse_ind + t_win_pm]
+            z_raw_win = self.z_raw[impulse_ind - t_win_pm:impulse_ind + t_win_pm]
+            z_filt_win = self.z_filtered[impulse_ind - t_win_pm:impulse_ind + t_win_pm]
 
         if pdf:
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.plot(times_win, z_raw_win, label='Raw')
-            ax.plot(times_win, z_filt_win, label='Filtered')
-            ax.set_xlabel('Time [s]')
+            ax.plot((times_win - np.mean(times_win))*1e6, z_raw_win, label='Raw')
+            ax.plot((times_win - np.mean(times_win))*1e6, z_filt_win, label='Filtered')
+            ax.set_xlabel(r'Time [$\mu$s]')
             ax.set_ylabel('$z$ response [V]')
-            ax.set_title('File {}, impulse {}'.format(file_num + 1, impulse_num + 1))
+            ax.set_title('{:.0f} keV impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
             ax.legend()
             ax.grid(which='both')
             pdf.savefig(fig, dpi=150)
@@ -281,29 +318,30 @@ class NanoFile:
         :return: best-fit parameters for the resonance and a success flag
         :rtype: tuple
         """
-        freq_filt, Pxx_filt = sig.welch(z_filt_win[:len(z_filt_win)//2], \
+        window = self.window_func(len(z_filt_win)//2)
+        freq_filt, Pxx_filt = sig.welch(window*z_filt_win[:len(z_filt_win)//2], \
                                         fs=self.f_samp, noverlap=0, nperseg=self.f_samp*0.001)
-
-        peak_ind = np.argmax(Pxx_filt)
         fit_bw_hz = 4e3
         f_win_pm = int(fit_bw_hz/2./np.diff(freq_filt)[0])
+        peak_ind = f_win_pm + np.argmax(Pxx_filt[f_win_pm:])
 
         freq_fit = freq_filt[peak_ind - f_win_pm:peak_ind + f_win_pm + 1]
         Pxx_fit = Pxx_filt[peak_ind - f_win_pm:peak_ind + f_win_pm + 1]
 
         omega = 2*np.pi*freq_fit
         omega_0_guess = 2*np.pi*freq_fit[np.argmax(Pxx_fit)]
-        gamma_guess = 2*np.pi*1e3
-        C_guess = np.sqrt(Pxx_fit[-1])
+        gamma_guess = 2*np.pi*1e-1
         A_guess = np.amax(Pxx_fit)*gamma_guess**2*omega_0_guess**2
-        p0 = (A_guess, omega_0_guess, gamma_guess)#, C_guess)
-        fit_log = False
+        p0 = (A_guess, omega_0_guess, gamma_guess)
+        fit_log = True
         try:
             if fit_log:
-                fit_func = lambda omega, A, omega_0, gamma: np.log(abs_susc2(omega, A, omega_0, gamma))
-                p, _ = curve_fit(fit_func, omega, np.log(Pxx_fit), p0=p0)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    fit_func = lambda omega, A, omega_0, gamma: np.log(abs_susc2(omega, A, omega_0, gamma))
+                    p, _ = curve_fit(fit_func, omega, np.log(Pxx_fit), p0=p0)
             else:
-                p, _ = curve_fit(abs_susc2, omega, Pxx_fit, p0=p0)#, sigma=Pxx_fit, absolute_sigma=True)
+                p, _ = curve_fit(abs_susc2, omega, Pxx_fit, p0=p0)
             success = True
         except RuntimeError:
             print('Error: fitting failed!')
@@ -326,7 +364,7 @@ class NanoFile:
                         #  + '$C={:.3f}\\times10^{{{:.0f}}}$'.format(mant[3], exp[3]))
             ax.set_xlabel('Frequency [Hz]')
             ax.set_ylabel(r'PSD [$\mathrm{V^2/Hz}$]')
-            ax.set_title('File {}, impulse {}'.format(file_num + 1, impulse_num + 1))
+            ax.set_title('{:.0f} keV impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
             ax.legend(loc='upper right')
             pdf.savefig(fig, dpi=150)
             fig.clf()
@@ -336,7 +374,8 @@ class NanoFile:
 
         return p, success
 
-    def compute_force(self, p, times_win, z_filt_win, file_num=None, impulse_num=None, pdf=None):
+    def compute_force(self, p, times_win, z_filt_win, file_num=None, impulse_num=None, \
+                      time_domain_pdf=None, freq_domain_pdf=None, optimal_filter_pdf=None, search=True):
         """Compute the force imparted by an impulse.
 
         :param p: parameters describing the resonance
@@ -355,60 +394,111 @@ class NanoFile:
         :rtype: float
         """
 
-        z_filt_win = sig.detrend(z_filt_win)
-        # z_filt_win *= sig.windows.hann(len(z_filt_win))
+        # z_filt_win = sig.detrend(z_filt_win)
+        z_filt_win *= self.window_func(len(z_filt_win))
 
-        z_fft = np.fft.rfft(z_filt_win)
+        z_fft = 2*np.fft.rfft(z_filt_win)/len(z_filt_win)
         freq_fft = np.fft.rfftfreq(n=len(z_filt_win), d=1./self.f_samp)
         # large variations in fitted amplitude can affect the results so we just use a constant
-        chi = susc(2.*np.pi*freq_fft, 1., p[1], 2*np.pi*200.)
+        # fit_ind = np.argmin(np.abs(2*np.pi*freq_fft - p[1]))
+        # freq_max = freq_fft[fit_ind - 10 + np.argmax(np.abs(z_fft[fit_ind - 10:fit_ind + 10]**2))]
+        chi = susc(2.*np.pi*freq_fft, 1., self.omega_0, self.gamma)#2*np.pi*10.)
+        self.susc = chi
+        self.susc_freq = freq_fft
         # C = 1e-27
         # C = np.abs(p[-1]/p[0]**2)
-        C = 0
-        # print(C)
-        F_fft = z_fft/(chi + C/np.conj(chi))
+        # C = 5e-23
+        C = self.noise_floor/(5e5)**2#p[0]**2
 
+        # model the noise PSD as proportional to the susceptibility plus constant imprecision
+        J_psd = np.abs(chi)**2 + C
+
+        # construct the optimal filter from the susceptibility and the noise
+        optimal = np.conj(chi)/J_psd
+
+        # compute the force from the product of Z(omega) and the optimal filter
+        F_fft = z_fft*optimal
+
+        # deconvolve to get force (Wiener filter picture) or get amplitude of signals matching template 
+        # vs time (optimal filter picture)
         f_td = np.fft.irfft(F_fft, n=len(z_filt_win))
 
         lpf = sig.butter(3, self.f_cutoff[1], btype='lowpass', output='sos', fs=self.f_samp)
         f_filt = sig.sosfiltfilt(lpf, f_td)
+        f_filt = np.copy(f_td)
         f_filt[:1000] = 0
         f_filt[-1000:] = 0
         f_td[:1000] = 0
         f_td[-1000:] = 0
 
-        force_ind = len(times_win)//2 - 10 + np.argmax(np.abs(f_filt[len(times_win)//2-10:len(times_win)//2+20]))
-        force = f_filt[force_ind]
+        if search:
+            width = int(self.search_window*self.f_samp)
+            force_ind = len(times_win)//2 - width//2 + np.argmax(np.abs(f_filt[len(times_win)//2 - width//2:\
+                                                                 len(times_win)//2 + width//2]))
+            force = f_filt[force_ind]
+        else:
+            force = np.std(f_filt)
+            force_ind = len(times_win)//2
 
-        if pdf:
+        if optimal_filter_pdf:
+            fig, ax = plt.subplots(2, figsize=(6, 6), layout='constrained')
+            sort_inds = np.concat((np.arange(len(times_win)//2, len(times_win)), np.arange(0, len(times_win)//2)))
+            ax[0].plot((times_win - np.mean(times_win))*1e6, np.fft.irfft(optimal)[sort_inds], \
+                       label='$C$ from noise')
+            ax[0].plot((times_win - np.mean(times_win))*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 10*C))[sort_inds], \
+                       label=r'$C\times10$')
+            ax[0].plot((times_win - np.mean(times_win))*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 0.1*C))[sort_inds], \
+                       label=r'$C/10$')
+            ax[0].set_xlim([-50, 50])
+            ax[0].set_xlabel(r'Time [$\mu$s]')
+            ax[0].set_ylabel('Filter magnitude [au]')
+            ax[0].legend()
+            ax[0].set_title('{:.0f} keV impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(optimal))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 10*C)))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 0.1*C)))
+            ax[1].set_xlabel('Frequency [kHz]')
+            ax[1].set_ylabel('Filter magnitude [au]')
+            ax[1].set_xlim([0, 1e2])
+            optimal_filter_pdf.savefig(fig, dpi=150)
+            fig.clf()
+            plt.close()
+            del fig, ax
+            gc.collect()
+
+        if time_domain_pdf:
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.plot(times_win, z_filt_win, label='$z$ position')
+            ax.plot((times_win - np.mean(times_win))*1e6, z_filt_win, label='$z$ position')
+            ax.axvline(0, color='C4', lw=1, ls='--', label='Impulse time', zorder=1000)
             ax2 = ax.twinx()
-            ax2.plot(times_win, f_td, color='C1', label='Force')
-            ax2.plot(times_win, f_filt, color='C2', label='Force filtered')
-            ax2.plot(times_win[force_ind], force, color='C3', marker='.', zorder=100)
-            ax.set_xlabel('Time [s]')
+            ax2.plot((times_win - np.mean(times_win))*1e6, f_td, color='C1', label='Force')
+            ax2.plot((times_win - np.mean(times_win))*1e6, f_filt, color='C2', label='Force filtered')
+            ax2.plot((times_win[force_ind] - np.mean(times_win))*1e6, force, color='C3', marker='.', ms=5, zorder=100)
+            ax.set_xlabel(r'Time [$\mu$s]')
             ax.set_ylabel('$z$ response [V]')
             ax2.set_ylabel('Force [au]')
-            ax.set_title('File {}, impulse {}'.format(file_num + 1, impulse_num + 1))
+            ax.set_title('{:.0f} keV impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
             ax.legend(loc='upper left')
             ax2.legend(loc='upper right')
-            pdf.savefig(fig, dpi=150)
+            time_domain_pdf.savefig(fig, dpi=150)
             fig.clf()
             plt.close()
             del fig, ax, ax2
             gc.collect()
 
+        if freq_domain_pdf:
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.semilogy(freq_fft, np.abs(z_fft)**2/np.amax(np.abs(z_fft)**2), label=r'$\tilde{z}(\omega)$')
-            ax.semilogy(freq_fft, np.abs(chi)**2/np.amax(np.abs(chi)**2), label=r'$\chi(\omega)$')
-            ax.semilogy(freq_fft, np.abs(F_fft)**2/np.amax(np.abs(F_fft)**2), label=r'$\tilde{F}(\omega)$')
-            ax.legend()
-            ax.set_xlabel('Frequency [Hz]')
-            ax.set_xlim([0, 1e5])
-            ax.set_ylabel('Magnitude')
+            ax.semilogy(freq_fft*1e-3, np.abs(z_fft)**2/np.amax(np.abs(z_fft)**2), label=r'$\tilde{z}(\omega)$')
+            ax.semilogy(freq_fft*1e-3, np.abs(chi)**2/np.amax(np.abs(chi)**2), label=r'$\chi(\omega)$')
+            ax.semilogy(freq_fft*1e-3, J_psd/np.amax(J_psd), label=r'$J(\omega)$')
+            ax.semilogy(freq_fft*1e-3, np.abs(F_fft)**2/np.amax(np.abs(F_fft)**2), label=r'$\tilde{F}(\omega)$')
+            ax.legend(ncol=2)
+            ax.set_xlabel('Frequency [kHz]')
+            ax.set_xlim([0, 1e2])
+            ax.set_ylabel('Magnitude [au]')
             ax.set_ylim([1e-12, 2e0])
-            pdf.savefig(fig, dpi=150)
+            ax.set_title('{:.0f} keV impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
+            freq_domain_pdf.savefig(fig, dpi=150)
             fig.clf()
             plt.close()
             del fig, ax
@@ -432,8 +522,11 @@ class NanoDataset:
         :param t_window: pulse window in seconds, defaults to 1e-3
         :type t_window: float, optional
         """
-        self.file_paths = glob(path + '_*.hdf5')[:max_files]
+        self.file_paths = glob(path + '_*.hdf5')
         self.file_inds = [int(f.split('_')[-1].split('.hdf5')[0]) for f in self.file_paths]
+        sort_inds = np.argsort(self.file_inds)
+        self.file_paths = np.array(self.file_paths)[sort_inds][:max_files]
+        self.file_inds = np.array(self.file_inds)[sort_inds][:max_files]
         self.plot_path = plot_path
         self.f_cutoff = f_cutoff
         self.t_window = t_window
@@ -445,26 +538,31 @@ class NanoDataset:
         """
         if self.plot_path:
             Path('/'.join(self.plot_path.split('/')[:-1])).mkdir(parents=True, exist_ok=True)
-            self.pulses_pdf = PdfPages(self.plot_path + '_pulses.pdf')
-            self.res_pdf = PdfPages(self.plot_path + '_res_fit.pdf')
-            self.imp_pdf = PdfPages(self.plot_path + '_impulses.pdf')
+            self.time_domain_pdf = PdfPages(self.plot_path + '_time_domain.pdf')
+            self.freq_domain_pdf = PdfPages(self.plot_path + '_freq_domain.pdf')
+            self.optimal_filter_pdf = PdfPages(self.plot_path + '_optimal_filter.pdf')
+            self.res_fit_pdf = PdfPages(self.plot_path + '_res_fit.pdf')
+            self.impulse_win_pdf = PdfPages(self.plot_path + '_impulse_window.pdf')
             self.spectra_pdf = PdfPages(self.plot_path + '_spectra.pdf')
-            self.time_pdf = PdfPages(self.plot_path + '_times.pdf')
+            self.impulse_times = PdfPages(self.plot_path + '_impulse_times.pdf')
         else:
-            self.pulses_pdf, self.res_pdf, self.imp_pdf, self.spectra_pdf, self.time_pdf \
-                = None, None, None, None, None
+            self.time_domain_pdf, self.freq_domain_pdf, self.res_fit_pdf, self.impulse_win_pdf, \
+                self.spectra_pdf, self.impulse_times = None, None, None, None, None, None
 
     def close_pdfs(self):
         """Close the PDF files.
         """
         if self.plot_path:
-            self.pulses_pdf.close()
-            self.res_pdf.close()
-            self.imp_pdf.close()
+            self.time_domain_pdf.close()
+            self.freq_domain_pdf.close()
+            self.optimal_filter_pdf.close()
+            self.res_fit_pdf.close()
+            self.impulse_win_pdf.close()
             self.spectra_pdf.close()
-            self.time_pdf.close()
+            self.impulse_times.close()
     
-    def load_files(self, resonance_params=None, pulse_amps_1e=None, pulse_amps_V=None):
+    def load_files(self, resonance_params=None, pulse_amps_1e=None, pulse_amps_V=None, \
+                   noise=False, search=True):
         """Load the datasets as NanoFile objects and extract relevant data from them.
 
         :param resonance_params: global resonance parameters to use, defaults to None
@@ -476,25 +574,30 @@ class NanoDataset:
         """
         forces = []
         res_params = []
+        suscs = []
 
         for i, fp in zip(self.file_inds, self.file_paths):
             if self.verbose:
                 print('Loading file {}...'.format(i+1))
             nf = NanoFile(fp, f_cutoff=self.f_cutoff, t_window=self.t_window, verbose=self.verbose)
             nf.calibrate_pulse_amp(pulse_amps_1e, pulse_amps_V)
-            nf.get_force_array(params=resonance_params, file_num=i, \
-                               pdfs=(self.pulses_pdf, self.res_pdf, self.imp_pdf, self.spectra_pdf, self.time_pdf))
+            nf.get_force_array(params=resonance_params, file_num=i, noise=noise, search=search, \
+                               pdfs=(self.time_domain_pdf, self.freq_domain_pdf, self.optimal_filter_pdf, \
+                                self.res_fit_pdf, self.impulse_win_pdf, self.spectra_pdf, self.impulse_times))
             forces.append(nf.forces.copy())
+            suscs.append(nf.susc.copy())
             if res_params is None:
                 res_params = [nf.resonance_params.copy()]
             else:
                 res_params.append(nf.resonance_params.copy())
             if i == 0:
                 self.pulse_amp_keV = nf.pulse_amp_keV.copy()
+                self.freqs = nf.susc_freq.copy()
 
             del nf
             gc.collect()
 
         self.forces = np.concatenate(forces)
         self.resonance_params = np.concatenate(res_params)
+        self.suscs = np.array(suscs)
         self.close_pdfs()
