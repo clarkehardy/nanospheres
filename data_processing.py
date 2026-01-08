@@ -3,6 +3,7 @@ import numpy as np
 from glob import glob
 from pathlib import Path
 import gc
+import yaml
 
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -56,7 +57,7 @@ class NanoFile:
 
     def __init__(self, file_path, f_cutoff=[2e4, 1e5], t_window=1e-3, search_window=5e-5, \
                  fit_window=1e1, d_sphere_nm=166., calibrate=False, cal_factors=[1, 0], \
-                 verbose=False, apply_notch=False):
+                 verbose=False, apply_notch=False, config=None):
         """Initializes a NanoFile object containing data from a single HDF5 file.
 
         :param file_path: path to the HDF5 file to load
@@ -83,10 +84,34 @@ class NanoFile:
         self.apply_notch = apply_notch
         self.pulse_amp_keV = None
         self.cal_factors = cal_factors
+        if config:
+            self.load_config(config)
         V_ns = (4/3.)*np.pi*(d_sphere_nm*1e-9/2.)**3
         rho_silica = 2.65e3 # density of silica, kg/m^3
         self.mass_sphere = rho_silica*V_ns # mass of the sphere in kg
         self.load_file()
+
+    def load_config(self, config):
+        """
+        Load class attributes from a config file. These will supersede any
+        values passed as input arguments to the init method.
+        
+        :param config: Either a dictionary or a path to a YAML file
+        :type config: dict or str or Path
+        """
+        # If config is a path (string or Path object), load the YAML file
+        if isinstance(config, (str, Path)):
+            with open(config, 'r') as f:
+                config_dict = yaml.safe_load(f)
+        # If config is already a dictionary, use it directly
+        elif isinstance(config, dict):
+            config_dict = config
+        else:
+            raise TypeError(f"config must be a dictionary or a path (str/Path), got {type(config)}")
+        
+        # Set class attributes from the dictionary
+        for key, value in config_dict.items():
+            setattr(self, key, value)
 
     def load_file(self):
         """Load data from the HDF5 file and do some preliminary processing.
@@ -963,7 +988,7 @@ class NanoDataset:
 
     def __init__(self, path, plot_path=None, f_cutoff=[2e4, 1e5], t_window=1e-3, \
                  search_window=5e-5, fit_window=1e-1, calibrate=False, max_files=1000, \
-                 max_windows=1000000, cal_factors=[1, 0], verbose=False, apply_notch=False):
+                 max_windows=1000000, cal_factors=[1, 0], verbose=False, apply_notch=False, config=None):
         """Initializes a NanoDataset object
 
         :param path: path to the files to be loaded
@@ -982,6 +1007,8 @@ class NanoDataset:
         :type verbose: bool, optional
         :param apply_notch: whether to build and apply notch filters, defaults to False
         :type apply_notch: bool, optional
+        :param config: configuration dictionary or path to YAML file to pass to NanoFile objects, defaults to None
+        :type config: dict or str or Path, optional
         """
         self.path = path
         self.file_paths = glob(path + '_*.hdf5')
@@ -999,6 +1026,7 @@ class NanoDataset:
         self.cal_factors = cal_factors
         self.verbose = verbose
         self.apply_notch = apply_notch
+        self.config = config
         self.create_pdfs()
 
     def create_pdfs(self):
@@ -1060,7 +1088,7 @@ class NanoDataset:
                 print('  Loading file {}...'.format(i+1))
             nf = NanoFile(fp, f_cutoff=self.f_cutoff, t_window=self.t_window, search_window=self.search_window, \
                           fit_window=self.fit_window, calibrate=self.calibrate, verbose=self.verbose, \
-                          apply_notch=self.apply_notch)
+                          apply_notch=self.apply_notch, config=self.config)
             nf.calibrate_pulse_amp(pulse_amps_1e, pulse_amps_V)
             nf.compute_and_fit_psd(file_num=i, pdf=self.spectra_pdf)
             impulse_inds = nf.get_impulse_inds(file_num=i, pdf=self.impulse_times_pdf)
@@ -1114,9 +1142,9 @@ class NanoDataset:
         for i, fp in zip(self.file_inds, self.file_paths):
             if self.verbose:
                 print('Loading file {}...'.format(i+1))
-            nf = NanoFile(fp, f_cutoff=self.f_cutoff, t_window=self.t_window, search_window=self.search_window, \
+            nf = NanoFile(fp, f_cutoff=self.f_cutoff, search_window=self.search_window, \
                           fit_window=self.fit_window, calibrate=self.calibrate, verbose=self.verbose, \
-                          apply_notch=self.apply_notch, cal_factors=self.cal_factors)
+                          apply_notch=self.apply_notch, cal_factors=self.cal_factors, config=self.config)
             nf.compute_and_fit_psd(file_num=i, pdf=self.spectra_pdf)
             nf.search_all_data(file_num=i, max_windows=self.max_windows, freq_domain_pdf=self.freq_domain_pdf, \
                                time_domain_pdf=self.time_domain_pdf)
