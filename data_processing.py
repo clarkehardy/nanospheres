@@ -55,7 +55,8 @@ class NanoFile:
     """
 
     def __init__(self, file_path, f_cutoff=[2e4, 1e5], t_window=1e-3, search_window=5e-5, \
-                 d_sphere_nm=166., verbose=False, apply_notch=False):
+                 fit_window=1e1, d_sphere_nm=166., calibrate=False, cal_factors=[1, 0], \
+                 verbose=False, apply_notch=False):
         """Initializes a NanoFile object containing data from a single HDF5 file.
 
         :param file_path: path to the HDF5 file to load
@@ -74,11 +75,14 @@ class NanoFile:
         self.file_path = file_path
         self.f_cutoff = f_cutoff
         self.t_window = t_window
+        self.fit_window = fit_window
+        self.calibrate = calibrate
         self.search_window = search_window
         self.window_func = 'tukey'
         self.verbose = verbose
         self.apply_notch = apply_notch
         self.pulse_amp_keV = None
+        self.cal_factors = cal_factors
         V_ns = (4/3.)*np.pi*(d_sphere_nm*1e-9/2.)**3
         rho_silica = 2.65e3 # density of silica, kg/m^3
         self.mass_sphere = rho_silica*V_ns # mass of the sphere in kg
@@ -105,7 +109,7 @@ class NanoFile:
         self.t_int = self.n_samp/self.f_samp
         self.times = np.arange(0, self.t_int, 1/self.f_samp)
 
-    def compute_sensitivity(self, Fxx, freqs, freq_range=[20e3, 100e3]):
+    def compute_sensitivity(self, Fxx, freqs, freq_range=[30e3, 70e3]):
         """Computes the force sensitivity from a force spectrum.
 
         :param Fxx: the force power spectral density
@@ -167,15 +171,12 @@ class NanoFile:
         q_drive = 2*sig.sosfiltfilt(lpf, drive*np.sin(phi))
         D = i_drive + 1j*q_drive
 
-        # compute the susceptibility in meters/Newton
-        self.susceptibility = lambda omega: susc(omega, 1, params[1], params[2])/self.mass_sphere
-
         # conversion factor from volts to meters
-        self.meters_per_volt = np.mean(self.n_charges*e*Efield*np.abs(D/R))*np.abs(self.susceptibility(2*np.pi*f_mon))
+        meters_per_volt = np.mean(self.n_charges*e*Efield*np.abs(D/R))*np.abs(self.susceptibility(2*np.pi*f_mon))
 
         if self.verbose:
             print('    Mass of the nanosphere: \t\t{:.3e} kg'.format(self.mass_sphere))
-            print('    Number of charges: \t\t{}'.format(int(self.n_charges)))
+            print('    Number of charges on the sphere: \t{}'.format(int(self.n_charges)))
             print('    Electric field per volt applied: \t{:.1f} V/m'.format(Efield))
             print('    Trap resonant frequency: \t\t{:.1f} kHz'.format(params[1]*1e-3/2/np.pi))
             print('    Drive signal from demodulation: \t{:.3f} V'.format(np.mean(np.abs(D))))
@@ -183,10 +184,9 @@ class NanoFile:
             print('    Sensor response from demodulation: \t{:.3e} V'.format(np.mean(np.abs(R))))
             print('    Susceptibility at {:.1f} kHz drive: \t{:.3e} m/V'.format(f_mon*1e-3, np.abs(self.susceptibility(2*np.pi*f_mon))))
             print('    Nanosphere response amplitude: \t{:.3e} m'.format(self.n_charges*e*Efield*np.mean(np.abs(D))*np.abs(self.susceptibility(2*np.pi*f_mon))))
-            print('    Position calibration factor: {:.3e} m/V'.format(self.meters_per_volt))
+            print('    Position calibration factor: \t{:.3e} m/V'.format(meters_per_volt))
 
-        # save the calibrated z position data
-        self.z_calibrated = self.z_filtered * self.meters_per_volt
+        return meters_per_volt
 
     def compute_and_fit_psd(self, file_num=None, pdf=None):
         """Filter the data and compute the power spectral density for the filtered data stream.
@@ -201,10 +201,11 @@ class NanoFile:
                                    output='sos', fs=self.f_samp)
         self.z_filtered = sig.sosfiltfilt(self.bandpass, self.z_raw)
 
-        nperseg = 2**19
+        nperseg = 2*len(self.z_raw)//120
         window_s1 = np.sum(sig.get_window(self.window_func, nperseg))
         window_s2 = np.sum(sig.get_window(self.window_func, nperseg)**2)
         spectrum_to_density = window_s1/np.sqrt(window_s2*self.f_samp)
+
         self.freqs, Pxx_z_raw = sig.welch(self.z_raw, fs=self.f_samp, window=self.window_func, nperseg=nperseg, scaling='spectrum')
         _, Pxx_z_filt = sig.welch(self.z_filtered, fs=self.f_samp, window=self.window_func, nperseg=nperseg, scaling='spectrum')
         if self.mon_raw is not None:
@@ -231,18 +232,33 @@ class NanoFile:
             self.notch_freqs = np.array([]).reshape(0, 2)
             self.notch_filters = np.array([[1., 0., 0., 1., 0., 0.]])
 
-        self.calibrate_spectrum(Pxx_mon_raw, Pxx_z_raw, p[0], p[1], p[3])
+        # compute the susceptibility in meters/Newton
+        self.susceptibility = lambda omega: susc(omega, 1, p[1], p[3])/self.mass_sphere
 
+        # calibrate from volts to meters
+        if self.calibrate:
+            self.meters_per_volt = self.calibrate_spectrum(Pxx_mon_raw, Pxx_z_raw, p[0], p[1], p[3])
+        else:
+            self.meters_per_volt = 5e-8 # default value; placeholder for now
+
+        # apply calibration factor to z data
+        self.z_calibrated = self.z_filtered * self.meters_per_volt
+
+        # save resonance parameters as class attributes
         self.gamma = p[-1]
         self.omega_0 = p[1]
         self.amplitude = p[0]*self.meters_per_volt*spectrum_to_density
 
-        Fxx = Pxx_z_raw*(spectrum_to_density*self.meters_per_volt/np.abs(self.susceptibility(2*np.pi*self.freqs)))**2
-        p_sens = self.compute_sensitivity(Fxx, self.freqs)
-
         self.susc_noise_floor = noise_floor*np.sqrt(2*np.pi)*spectrum_to_density**2/p[0]**2/self.mass_sphere**2/p[3]/p[1]**2
 
         if pdf:
+            Fxx = Pxx_z_filt*(spectrum_to_density*self.meters_per_volt/np.abs(self.susceptibility(2*np.pi*self.freqs)))**2
+            p_sens = self.compute_sensitivity(Fxx, self.freqs)
+
+            if self.pulse_amp_keV:
+                title = '{:.0f} keV/c impulse, file {}'.format(self.pulse_amp_keV, file_num + 1)
+            else:
+                title = 'File {}'.format(file_num + 1)
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
             ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_raw)*spectrum_to_density, alpha=1.0, label='$z$ raw')
             ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_filt)*spectrum_to_density, alpha=1.0, label='$z$ filtered')
@@ -251,10 +267,7 @@ class NanoFile:
             ax.semilogy(self.freqs*1e-3, np.abs(susc(2*np.pi*self.freqs, 1/self.mass_sphere, p[1], p[3])) \
                         *p[0]*self.mass_sphere*np.sqrt(p[3]*p[1]**2/np.sqrt(2*np.pi))*spectrum_to_density, \
                         alpha=1.0, label=r'Scaled $\chi$')
-            if self.pulse_amp_keV:
-                ax.set_title('{:.0f} keV/c impulse, file {}'.format(self.pulse_amp_keV, file_num + 1))
-            else:
-                ax.set_title('File {}'.format(file_num + 1))
+            ax.set_title(title)
             ax.set_xlabel('Frequency [kHz]')
             ax.set_ylabel(r'Raw ASD [V/$\sqrt{\mathrm{Hz}}$]')
             ax.set_ylim([1e-7, 1e-1])
@@ -277,14 +290,11 @@ class NanoFile:
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
             ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_filt)*spectrum_to_density*self.meters_per_volt/\
                                          np.abs(self.susceptibility(2*np.pi*self.freqs)), alpha=1.0, label='$z$ raw')
-            if self.pulse_amp_keV:
-                ax.set_title('{:.0f} keV/c impulse, file {}'.format(self.pulse_amp_keV, file_num + 1))
-            else:
-                ax.set_title('File {}'.format(file_num + 1))
+            ax.set_title(title)
             ax.set_xlabel('Frequency [kHz]')
             ax.set_ylabel(r'Calibrated ASD [$\mathrm{N/\sqrt{Hz}}$]')
             ax.set_xlim([20, 100])
-            ax.set_ylim([1e-20, 1e-18])
+            ax.set_ylim([1e-21, 1e-18])
             ax.text(0.03, 0.97, '$\\Delta p={:.1f}$ keV/c'.format(p_sens), ha='left', va='top', transform=ax.transAxes)
             ax.grid(which='both')
             pdf.savefig(fig, dpi=150)
@@ -295,10 +305,7 @@ class NanoFile:
 
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
             ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_filt)*spectrum_to_density*self.meters_per_volt)
-            if self.pulse_amp_keV:
-                ax.set_title('{:.0f} keV/c impulse, file {}'.format(self.pulse_amp_keV, file_num + 1))
-            else:
-                ax.set_title('File {}'.format(file_num + 1))
+            ax.set_title(title)
             ax.set_xlabel('Frequency [kHz]')
             ax.set_ylabel(r'Calibrated ASD [$\mathrm{m/\sqrt{Hz}}$]')
             ax.set_xlim([20, 100])
@@ -618,8 +625,16 @@ class NanoFile:
         
         self.impulses = np.array(impulses)
         self.deconvolved_pulses = np.array(deconvolved_pulses)
+        self.convert_to_keV()
         self.recon_impulse_inds = np.array(recon_impulse_inds)
         self.pulse_times = np.array(pulse_times)
+
+    def convert_to_keV(self):
+        """Convert the impulses in force units to keV using the calibration
+        factors computed separately.
+        """
+        self.impulses = self.impulses * self.cal_factors[0] + self.cal_factors[1]
+        self.deconvolved_pulses = self.deconvolved_pulses * self.cal_factors[0] + self.cal_factors[1]
 
     def get_impulse_array(self, impulse_inds, global_params=True, file_num=0, pdfs=None):
         """Computes the impulse at each index.
@@ -642,7 +657,7 @@ class NanoFile:
         for i, ind in enumerate(impulse_inds):
             if self.verbose:
                 print('    -> Computing impulse for kick at t={:.5f} seconds...'.format(self.times[ind]))
-            times_win, z_win = self.get_time_window(ind, t_window=1e-1, centered=False)
+            times_win, z_win = self.get_time_window(ind, t_window=self.fit_window, centered=False)
             p, success = self.fit_susceptibility(z_win, file_num, i, res_fit_pdf, noise_spectra_pdf)
             if not success:
                 print(f'Fit for impulse {i + 1} failed! Skipping')
@@ -678,8 +693,10 @@ class NanoFile:
         :return: best-fit parameters for the resonance and a success flag
         :rtype: tuple
         """
-        nperseg = len(z_win)//8
+        nperseg = 2*len(z_win)//12
         freq_filt, Pxx_filt = sig.welch(z_win, fs=self.f_samp, window=self.window_func, nperseg=nperseg)
+        # Pxx_filt = np.abs(np.fft.rfft(z_win)*np.sqrt(2/len(z_win)/self.f_samp))**2
+        # freq_filt = np.fft.rfftfreq(n=len(z_win), d=1./self.f_samp)
         fit_bw_hz = 10*self.f_samp/nperseg
         f_win_pm = int(fit_bw_hz/2./np.diff(freq_filt)[0])
         peak_ind = f_win_pm + np.argmax(Pxx_filt[f_win_pm:])
@@ -906,13 +923,12 @@ class NanoFile:
             gc.collect()
 
         if freq_domain_pdf:
+            spectrum_to_density = np.sqrt(len(z_win)/self.f_samp)
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.semilogy(freq_fft*1e-3, np.abs(z_fft), color='C0', label=r'$\tilde{z}(\omega)$')
+            ax.semilogy(freq_fft*1e-3, np.abs(z_fft)*spectrum_to_density, color='C0', label=r'$\tilde{z}(\omega)$')
             ax.legend()
-            # ax.semilogy(freq_fft*1e-3, np.abs(chi), label=r'$\chi(\omega)$')
-            # ax.semilogy(freq_fft*1e-3, np.sqrt(J_psd), label=r'$J(\omega)$')
             ax2 = ax.twinx()
-            ax2.semilogy(freq_fft*1e-3, np.abs(F_fft), color='C1', label=r'$\tilde{F}(\omega)$')
+            ax2.semilogy(freq_fft*1e-3, np.abs(F_fft)*spectrum_to_density, color='C1', label=r'$\tilde{F}(\omega)$')
             ax2.legend()
             handles = []
             labels = []
@@ -922,11 +938,11 @@ class NanoFile:
                 handles.extend(h)
                 labels.extend(l)
             ax.legend(handles, labels)
-            ax.set_ylabel('$z$ amplitude [m]')
-            ax2.set_ylabel('Force amplitude [N]')
+            ax.set_ylabel(r'$z$ ASD [m/$\sqrt{\mathrm{Hz}}$]')
+            ax2.set_ylabel(r'Force ASD [N/$\sqrt{\mathrm{Hz}}$]')
             ax.set_xlim([20, 100])
-            ax.set_ylim([1e-13, 1e-8])
-            ax2.set_ylim([1e-19, 1e-14])
+            ax.set_ylim([1e-14, 1e-9])
+            ax2.set_ylim([1e-20, 1e-15])
             ax.grid(which='both')
             ax.set_xlabel('Frequency [kHz]')
             if self.pulse_amp_keV:
@@ -946,7 +962,8 @@ class NanoDataset:
     """
 
     def __init__(self, path, plot_path=None, f_cutoff=[2e4, 1e5], t_window=1e-3, \
-                 search_window=5e-5, max_files=1000, max_windows=1000000, verbose=False, apply_notch=False):
+                 search_window=5e-5, fit_window=1e-1, calibrate=False, max_files=1000, \
+                 max_windows=1000000, cal_factors=[1, 0], verbose=False, apply_notch=False):
         """Initializes a NanoDataset object
 
         :param path: path to the files to be loaded
@@ -977,6 +994,9 @@ class NanoDataset:
         self.f_cutoff = f_cutoff
         self.t_window = t_window
         self.search_window = search_window
+        self.fit_window = fit_window
+        self.calibrate = calibrate
+        self.cal_factors = cal_factors
         self.verbose = verbose
         self.apply_notch = apply_notch
         self.create_pdfs()
@@ -1039,7 +1059,8 @@ class NanoDataset:
             if self.verbose:
                 print('  Loading file {}...'.format(i+1))
             nf = NanoFile(fp, f_cutoff=self.f_cutoff, t_window=self.t_window, search_window=self.search_window, \
-                          verbose=self.verbose, apply_notch=self.apply_notch)
+                          fit_window=self.fit_window, calibrate=self.calibrate, verbose=self.verbose, \
+                          apply_notch=self.apply_notch)
             nf.calibrate_pulse_amp(pulse_amps_1e, pulse_amps_V)
             nf.compute_and_fit_psd(file_num=i, pdf=self.spectra_pdf)
             impulse_inds = nf.get_impulse_inds(file_num=i, pdf=self.impulse_times_pdf)
@@ -1059,6 +1080,7 @@ class NanoDataset:
                 res_params.append(nf.resonance_params.copy())
             if i == 0:
                 self.pulse_amp_keV = nf.pulse_amp_keV.copy()
+                self.freqs = nf.freqs.copy()
 
             del nf
             gc.collect()
@@ -1092,14 +1114,18 @@ class NanoDataset:
         for i, fp in zip(self.file_inds, self.file_paths):
             if self.verbose:
                 print('Loading file {}...'.format(i+1))
-            nf = NanoFile(fp, f_cutoff=self.f_cutoff, t_window=self.t_window, verbose=self.verbose, \
-                          apply_notch=self.apply_notch)
+            nf = NanoFile(fp, f_cutoff=self.f_cutoff, t_window=self.t_window, search_window=self.search_window, \
+                          fit_window=self.fit_window, calibrate=self.calibrate, verbose=self.verbose, \
+                          apply_notch=self.apply_notch, cal_factors=self.cal_factors)
             nf.compute_and_fit_psd(file_num=i, pdf=self.spectra_pdf)
             nf.search_all_data(file_num=i, max_windows=self.max_windows, freq_domain_pdf=self.freq_domain_pdf, \
                                time_domain_pdf=self.time_domain_pdf)
             impulses.append(nf.impulses.copy())
             pulses.append(nf.deconvolved_pulses.copy())
             recon_impulse_inds.append(nf.recon_impulse_inds)
+
+            if i == 0:
+                self.freqs = nf.freqs.copy()
 
             del nf
             gc.collect()
