@@ -55,7 +55,7 @@ class NanoFile:
     """Class to handle an individual file containing nanosphere data.
     """
 
-    def __init__(self, file_path, f_cutoff=[2e4, 1e5], t_window=1e-3, search_window=5e-5, \
+    def __init__(self, file_path, f_cutoff=[2e4, 1e5], search_window=5e-5, \
                  fit_window=1e1, d_sphere_nm=166., calibrate=False, cal_factors=[1, 0], \
                  verbose=False, apply_notch=False, config=None):
         """Initializes a NanoFile object containing data from a single HDF5 file.
@@ -75,7 +75,7 @@ class NanoFile:
         """
         self.file_path = file_path
         self.f_cutoff = f_cutoff
-        self.t_window = t_window
+        # self.t_window = t_window
         self.fit_window = fit_window
         self.calibrate = calibrate
         self.search_window = search_window
@@ -274,7 +274,7 @@ class NanoFile:
         self.omega_0 = p[1]
         self.amplitude = p[0]*self.meters_per_volt*spectrum_to_density
 
-        self.susc_noise_floor = noise_floor*np.sqrt(2*np.pi)*spectrum_to_density**2/p[0]**2/self.mass_sphere**2/p[3]/p[1]**2
+        # self.susc_noise_floor = noise_floor*np.sqrt(2*np.pi)*spectrum_to_density**2/p[0]**2/self.mass_sphere**2/p[3]/p[1]**2
 
         if pdf:
             Fxx = Pxx_z_filt*(spectrum_to_density*self.meters_per_volt/np.abs(self.susceptibility(2*np.pi*self.freqs)))**2
@@ -608,7 +608,8 @@ class NanoFile:
 
         return times_win, z_win
 
-    def search_all_data(self, file_num=None, max_windows=1000000, freq_domain_pdf=None, time_domain_pdf=None):
+    def search_all_data(self, file_num=None, max_windows=1000000, freq_domain_pdf=None, time_domain_pdf=None, \
+                        res_fit_pdf=None, noise_spectra_pdf=None, quality_check_window=None):
         """Searches through all segments of the file and reconstructs the largest impulse in each.
 
         :param file_num: file number, defaults to None
@@ -619,47 +620,149 @@ class NanoFile:
         :type freq_domain_pdf: PdfPages, optional
         :param time_domain_pdf: PDF in which to save the time domain figure, defaults to None
         :type time_domain_pdf: PdfPages, optional
+        :param quality_check_window: time window in seconds for quality checks, defaults to None
+        :type quality_check_window: float, optional
         """
         search_win = int(self.search_window*self.f_samp)
-        time_win = int(self.t_window*self.f_samp)
-        impulses = []
-        deconvolved_pulses = []
-        recon_impulse_inds = []
-        pulse_times = []
+        time_win = 5*search_win
         
         first_center = time_win // 2
         last_center = len(self.times) - time_win // 2
         centers = np.arange(first_center, last_center, search_win)
-        num_windows = len(centers)
+        num_windows = min(len(centers), max_windows)
         
+        # Pre-allocate numpy arrays instead of using lists
+        impulses = np.empty(num_windows, dtype=float)
+        deconvolved_pulses = np.empty((num_windows, time_win), dtype=float)
+        recon_impulse_inds = np.empty(num_windows, dtype=int)
+        pulse_times = np.empty(num_windows, dtype=float)
+        resonance_params = np.empty((num_windows, 3), dtype=float)
+        
+        # Initialize quality check tracking array
+        quality_passed = np.empty(num_windows, dtype=bool)
+        
+        # Set up quality check parameters if quality_check_window is provided
+        quality_check_samples = None
+        last_quality_check_center = None
+        current_quality_status = True
+        if quality_check_window is not None:
+            quality_check_samples = int(quality_check_window * self.f_samp)
+        
+        # Convert fit_window from seconds to samples
+        fit_window_samples = int(self.fit_window * self.f_samp)
+        last_optimal_center = None
+        optimal = None
+        current_params = None
+
         for i, center in enumerate(centers):
             if i >= max_windows:
                 break
-            if self.verbose:
+            if self.verbose and ((i + 1) % 10000 == 0):
                 print('    -> Computing force for window {} of {}...'.format(i + 1, num_windows))
+            
+            # Perform quality check if enabled and at the right interval
+            if quality_check_samples is not None:
+                # Check if we should perform quality check at this iteration
+                # Perform check every time we've moved forward by quality_check_samples
+                if last_quality_check_center is None or (center - last_quality_check_center) >= quality_check_samples:
+                    # Get the z data for the quality check window centered at current position
+                    quality_start = max(0, center - quality_check_samples // 2)
+                    quality_end = min(len(self.z_calibrated), center + quality_check_samples // 2)
+                    z_quality_win = self.z_calibrated[quality_start:quality_end]
+                    
+                    # Perform quality check
+                    current_quality_status = self.check_quality(z_quality_win, quality_check_window)
+                    last_quality_check_center = center
+                
+                # Assign the current quality status to this iteration
+                quality_passed[i] = current_quality_status
+            else:
+                # If quality checking is disabled, mark all as passed
+                quality_passed[i] = True
+            
+            # Compute optimal filter only if we've moved forward by fit_window samples
+            if optimal is None or (center - last_optimal_center) >= fit_window_samples:
+                # Get a window of data for fitting susceptibility
+                _, z_fit_win = self.get_time_window(center, t_window=self.fit_window, centered=True, end_mode='pad')
+                # Fit susceptibility to get resonance parameters
+                params, success = self.fit_susceptibility(z_fit_win, file_num=file_num, impulse_num=i, \
+                                                          res_fit_pdf=res_fit_pdf, noise_spectra_pdf=noise_spectra_pdf)
+                if success:
+                    current_params = params
+                    optimal = self.build_optimal_filter(time_win, params)
+                else:
+                    # If fit fails, fall back to using global parameters
+                    current_params = None
+                    optimal = self.build_optimal_filter(time_win, None)
+                last_optimal_center = center
+            
+            # Store resonance parameters for this window
+            resonance_params[i] = current_params
+            
             start_idx = center - time_win // 2
             end_idx = center + time_win // 2
             times_win = np.copy(self.times[start_idx:end_idx])
             z_win = np.copy(self.z_calibrated[start_idx:end_idx])
-            pulse, imp_ind, imp_time = self.compute_impulse(times_win, z_win, file_num=file_num, impulse_num=i, \
+            pulse, imp_ind, imp_time = self.compute_impulse(times_win, z_win, optimal, file_num=file_num, impulse_num=i, \
                                                             freq_domain_pdf=freq_domain_pdf, time_domain_pdf=time_domain_pdf)
-            impulses.append(pulse[imp_ind])
-            deconvolved_pulses.append(pulse)
-            recon_impulse_inds.append(imp_ind)
-            pulse_times.append(imp_time)
+            impulses[i] = pulse[imp_ind]
+            deconvolved_pulses[i] = pulse
+            recon_impulse_inds[i] = imp_ind
+            pulse_times[i] = imp_time
         
-        self.impulses = np.array(impulses)
-        self.deconvolved_pulses = np.array(deconvolved_pulses)
+        self.impulses = impulses
+        self.deconvolved_pulses = deconvolved_pulses
+        self.resonance_params = resonance_params
         self.convert_to_keV()
-        self.recon_impulse_inds = np.array(recon_impulse_inds)
-        self.pulse_times = np.array(pulse_times)
+        self.recon_impulse_inds = recon_impulse_inds
+        self.pulse_times = pulse_times
+        self.quality_passed = quality_passed
+
+    def check_quality(self, z_data, t_window):
+        """Perform quality checks on a segment of calibrated z data.
+        
+        Checks for discontinuous jumps in the data by examining the differences
+        between consecutive values. If any jump exceeds a threshold based on
+        the standard deviation of the differences, the segment fails the quality cut.
+        
+        :param z_data: calibrated z position data to check
+        :type z_data: numpy.ndarray
+        :param t_window: time window in seconds for the data segment
+        :type t_window: float
+        :return: True if data passes quality checks, False otherwise
+        :rtype: bool
+        """
+        if len(z_data) < 2:
+            return False
+        
+        # Calculate differences between consecutive values
+        diffs = np.diff(z_data)
+        
+        # Calculate statistics of the differences
+        diff_std = np.std(diffs)
+        diff_mean = np.mean(np.abs(diffs))
+        
+        # Check for discontinuous jumps
+        # A jump is defined as a difference that exceeds a threshold
+        # Use a multiple of the standard deviation as the threshold
+        # Also consider the mean absolute difference to avoid false positives
+        jump_threshold = max(5 * diff_std, 3 * diff_mean)
+        
+        # If any difference exceeds the threshold, there's a discontinuous jump
+        max_jump = np.max(np.abs(diffs))
+        if max_jump > jump_threshold:
+            return False
+        
+        return True
 
     def convert_to_keV(self):
         """Convert the impulses in force units to keV using the calibration
         factors computed separately.
         """
-        self.impulses = self.impulses * self.cal_factors[0] + self.cal_factors[1]
-        self.deconvolved_pulses = self.deconvolved_pulses * self.cal_factors[0] + self.cal_factors[1]
+        self.impulses *= self.cal_factors[0]
+        self.impulses += self.cal_factors[1]
+        self.deconvolved_pulses *= self.cal_factors[0]
+        self.deconvolved_pulses += self.cal_factors[1]
 
     def get_impulse_array(self, impulse_inds, global_params=True, file_num=0, pdfs=None):
         """Computes the impulse at each index.
@@ -688,11 +791,13 @@ class NanoFile:
                 print(f'Fit for impulse {i + 1} failed! Skipping')
                 continue
             resonance_params.append(p)
-            times_win, z_win = self.get_time_window(ind, t_window=self.t_window, centered=True, \
+            times_win, z_win = self.get_time_window(ind, t_window=5*self.search_window, centered=True, \
                                                     file_num=file_num, impulse_num=i, pdf=impulse_win_pdf, \
                                                     end_mode='pad')
-            pulse, imp_ind, imp_time = self.compute_impulse(times_win, z_win, file_num, i, [p, None][int(global_params)], \
-                                                            optimal_filter_pdf, time_domain_pdf, freq_domain_pdf)
+            optimal = self.build_optimal_filter(len(times_win), [p, None][int(global_params)], file_num, \
+                                                i, optimal_filter_pdf)
+            pulse, imp_ind, imp_time = self.compute_impulse(times_win, z_win, optimal, file_num, i, \
+                                                            time_domain_pdf, freq_domain_pdf)
             impulses.append(pulse[imp_ind])
             deconvolved_pulses.append(pulse)
             recon_impulse_inds.append(imp_ind)
@@ -745,7 +850,7 @@ class NanoFile:
         m.limits['omega_0'] = (np.amin(omega), np.amax(omega))
         m.limits['gamma'] = (0, np.inf)
         m.migrad()
-        p = m.values
+        p = np.array(m.values)
         success = m.valid
 
         plot_freq = np.linspace(freq_filt[peak_ind - 3*f_win_pm], freq_filt[peak_ind + 3*f_win_pm + 1], 1000)
@@ -802,33 +907,29 @@ class NanoFile:
 
         return p, success
 
-    def deconvolve_response(self, times_win, z_win, file_num=None, impulse_num=None, params=None, \
-                            optimal_filter_pdf=None):
-        """Deconvolve the response of the oscillator from the position data.
+    def build_optimal_filter(self, window_len, params=None, file_num=None, impulse_num=None, pdf=None):
+        """Build the optimal filter to deconvolve the response of the oscillator from the position data.
 
-        :param times_win: array of times around the impulse
-        :type times_win: numpy.ndarray
-        :param z__win: filtered z data around the impulse
-        :type z_win: numpy.ndarray
+        :param window_len: length of the time window
+        :type window_len: numpy.ndarray
+        :param params: resonance params to use. If None, uses global parameters
+        :type params: numpy.ndarray
         :param file_num: file number, defaults to None
         :type file_num: int, optional
         :param impulse_num: impulse_number, defaults to None
         :type impulse_num: int, optional
-        :param params: resonance params to use. If None, uses global parameters
-        :type params: numpy.ndarray
-        :param optimal_filter_pdf: PDF in which to save the optimal filter figure, defaults to None
-        :type optimal_filter_pdf: PdfPages, optional
-        :return: force spectrum and corresponding frequencies
+        :param pdf: PDF in which to save the optimal filter figure, defaults to None
+        :type pdf: PdfPages, optional
+        :return: frequency domain optimal filter
         :rtype: tuple of numpy.ndarray
         """
+        freq_fft = np.fft.rfftfreq(n=window_len, d=1./self.f_samp)
 
-        z_fft = np.fft.rfft(z_win)*np.sqrt(2)/len(z_win)
-        freq_fft = np.fft.rfftfreq(n=len(z_win), d=1./self.f_samp)
         if params is None:
             chi = susc(2.*np.pi*freq_fft, 1./self.mass_sphere, self.omega_0, self.gamma)
         else: 
             chi = susc(2.*np.pi*freq_fft, 1./self.mass_sphere, params[1], self.gamma)
-            
+
         C = 5e-23/self.mass_sphere**2
 
         # model the noise PSD as proportional to the susceptibility plus constant imprecision noise
@@ -837,17 +938,16 @@ class NanoFile:
         # construct the optimal filter from the susceptibility and the noise
         optimal = np.conj(chi)/J_psd
 
-        # apply the optimal filter to deconvolve the response and get the force spectrum
-        F_fft = z_fft * optimal
+        if pdf:
+            time_array = np.arange(-window_len/2/self.f_samp, window_len/2/self.f_samp, 1/self.f_samp)
 
-        if optimal_filter_pdf:
             fig, ax = plt.subplots(2, figsize=(6, 6), layout='constrained')
-            sort_inds = np.concat((np.arange(len(times_win)//2, len(times_win)), np.arange(0, len(times_win)//2)))
-            ax[0].plot((times_win - times_win[len(times_win)//2])*1e6, np.fft.irfft(optimal)[sort_inds], \
+            sort_inds = np.concat((np.arange(window_len//2, window_len), np.arange(0, window_len//2)))
+            ax[0].plot(time_array*1e6, np.fft.irfft(optimal)[sort_inds], \
                        label='$C$ from noise')
-            ax[0].plot((times_win - times_win[len(times_win)//2])*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 10*C))[sort_inds], \
+            ax[0].plot(time_array*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 10*C))[sort_inds], \
                        label=r'$C\times10$')
-            ax[0].plot((times_win - times_win[len(times_win)//2])*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 0.1*C))[sort_inds], \
+            ax[0].plot(time_array*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 0.1*C))[sort_inds], \
                        label=r'$C/10$')
             ax[0].set_xlim([-20, 20])
             ax[0].set_xlabel(r'Time [$\mu$s]')
@@ -863,16 +963,16 @@ class NanoFile:
             ax[1].set_xlabel('Frequency [kHz]')
             ax[1].set_ylabel('Filter magnitude [au]')
             ax[1].set_xlim([0, 1e2])
-            optimal_filter_pdf.savefig(fig, dpi=150)
+            pdf.savefig(fig, dpi=150)
             fig.clf()
             plt.close()
             del fig, ax
             gc.collect()
 
-        return F_fft, z_fft, freq_fft
+        return optimal
 
-    def compute_impulse(self, times_win, z_win, file_num=None, impulse_num=None, params=None, \
-                        optimal_filter_pdf=None, time_domain_pdf=None, freq_domain_pdf=None):
+    def compute_impulse(self, times_win, z_win, optimal, file_num=None, impulse_num=None, \
+                        time_domain_pdf=None, freq_domain_pdf=None):
         """Compute the impulse imparted by a kick.
 
         :param times_win: array of times around the impulse
@@ -894,33 +994,38 @@ class NanoFile:
         :return: the waveform containing the pulse, the index of the impulse, and the time of the window
         :rtype: tuple
         """
-
-        F_fft, z_fft, freq_fft = self.deconvolve_response(times_win, z_win, file_num=file_num, impulse_num=impulse_num, \
-                                                          params=params, optimal_filter_pdf=optimal_filter_pdf)
+        # F_fft, z_fft = self.deconvolve_response(times_win, z_win, file_num=file_num, impulse_num=impulse_num, \
+        #                                         optimal=optimal, params=params, optimal_filter_pdf=optimal_filter_pdf)
+        F_fft = np.fft.rfft(z_win) * optimal #*np.sqrt(2)/len(z_win)
+        freq_fft = np.fft.rfftfreq(n=len(z_win), d=1/self.f_samp)
 
         # deconvolve to get force (Wiener filter picture) or get amplitude of signals matching template 
         # vs time (optimal filter picture)
-        f_td = np.fft.irfft(F_fft, n=len(z_win))/np.sqrt(2)*len(z_win)
+        f_filt = np.fft.irfft(F_fft, n=len(z_win))#/np.sqrt(2)*len(z_win)
 
-        lpf = sig.butter(3, self.f_cutoff[1], btype='lowpass', output='sos', fs=self.f_samp)
-        f_filt = sig.sosfiltfilt(lpf, f_td)
-        f_filt = np.copy(f_td)
-        f_filt[:1000] = 0
-        f_filt[-1000:] = 0
-        f_td[:1000] = 0
-        f_td[-1000:] = 0
+        # lpf = sig.butter(3, self.f_cutoff[1], btype='lowpass', output='sos', fs=self.f_samp)
+        # f_filt = sig.sosfiltfilt(lpf, f_td)
+        # f_filt = np.copy(f_td)
+        f_filt[:len(z_win)//4] = 0
+        f_filt[-len(z_win)//4:] = 0
+        # f_td[:1000] = 0
+        # f_td[-1000:] = 0
 
         # find the maximum within the search window
         width = int(self.search_window*self.f_samp)
         imp_ind = len(times_win)//2 - width//2 + np.argmax(np.abs(f_filt[len(times_win)//2 - width//2:\
-                                                             len(times_win)//2 + width//2]))
+                                                                  len(times_win)//2 + width//2]))
         impulse = f_filt[imp_ind]
 
         if time_domain_pdf:
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
             ax.plot((times_win - times_win[imp_ind])*1e6, z_win*1e9, label='$z$ position')
-            ax.axvline((times_win[len(times_win)//2] - times_win[imp_ind])*1e6, \
-                       color='C4', lw=1, ls='--', label='Impulse time', zorder=10)
+            if self.pulse_amp_keV:
+                ax.set_title('{:.0f} keV/c impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
+                ax.axvline((times_win[len(times_win)//2] - times_win[imp_ind])*1e6, \
+                            color='C4', lw=1, ls='--', label='Impulse time', zorder=10)
+            else:
+                ax.set_title('File {}, impulse {}'.format(file_num + 1, impulse_num + 1))
             ax2 = ax.twinx()
             ax2.plot((times_win - times_win[imp_ind])*1e6, f_filt*1e18, color='C1', label='Force')
             ax2.plot(0, impulse*1e18, color='C3', marker='.', ms=8, ls='none', label='Reconstructed', zorder=10)
@@ -937,10 +1042,6 @@ class NanoFile:
                 handles.extend(h)
                 labels.extend(l)
             ax2.legend(handles, labels, ncol=2, loc='upper left')
-            if self.pulse_amp_keV:
-                ax.set_title('{:.0f} keV/c impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
-            else:
-                ax.set_title('File {}, impulse {}'.format(file_num + 1, impulse_num + 1))
             time_domain_pdf.savefig(fig, dpi=150)
             fig.clf()
             plt.close()
@@ -950,7 +1051,7 @@ class NanoFile:
         if freq_domain_pdf:
             spectrum_to_density = np.sqrt(len(z_win)/self.f_samp)
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.semilogy(freq_fft*1e-3, np.abs(z_fft)*spectrum_to_density, color='C0', label=r'$\tilde{z}(\omega)$')
+            ax.semilogy(freq_fft*1e-3, np.abs(np.fft.rfft(z_win)*np.sqrt(2)/len(z_win))*spectrum_to_density, color='C0', label=r'$\tilde{z}(\omega)$')
             ax.legend()
             ax2 = ax.twinx()
             ax2.semilogy(freq_fft*1e-3, np.abs(F_fft)*spectrum_to_density, color='C1', label=r'$\tilde{F}(\omega)$')
@@ -986,9 +1087,10 @@ class NanoDataset:
     """Class to handle a dataset containing multiple files of nanosphere data.
     """
 
-    def __init__(self, path, plot_path=None, f_cutoff=[2e4, 1e5], t_window=1e-3, \
+    def __init__(self, path, plot_path=None, f_cutoff=[2e4, 1e5], \
                  search_window=5e-5, fit_window=1e-1, calibrate=False, max_files=1000, \
-                 max_windows=1000000, cal_factors=[1, 0], verbose=False, apply_notch=False, config=None):
+                 max_windows=1000000, cal_factors=[1, 0], verbose=False, apply_notch=False, \
+                 config=None, quality_check_window=None):
         """Initializes a NanoDataset object
 
         :param path: path to the files to be loaded
@@ -1009,6 +1111,8 @@ class NanoDataset:
         :type apply_notch: bool, optional
         :param config: configuration dictionary or path to YAML file to pass to NanoFile objects, defaults to None
         :type config: dict or str or Path, optional
+        :param quality_check_window: time window in seconds for quality checks, defaults to None
+        :type quality_check_window: float, optional
         """
         self.path = path
         self.file_paths = glob(path + '_*.hdf5')
@@ -1019,7 +1123,7 @@ class NanoDataset:
         self.max_windows = max_windows
         self.plot_path = plot_path
         self.f_cutoff = f_cutoff
-        self.t_window = t_window
+        # self.t_window = t_window
         self.search_window = search_window
         self.fit_window = fit_window
         self.calibrate = calibrate
@@ -1027,6 +1131,7 @@ class NanoDataset:
         self.verbose = verbose
         self.apply_notch = apply_notch
         self.config = config
+        self.quality_check_window = quality_check_window
         self.create_pdfs()
 
     def create_pdfs(self):
@@ -1086,7 +1191,7 @@ class NanoDataset:
         for i, fp in zip(self.file_inds, self.file_paths):
             if self.verbose:
                 print('  Loading file {}...'.format(i+1))
-            nf = NanoFile(fp, f_cutoff=self.f_cutoff, t_window=self.t_window, search_window=self.search_window, \
+            nf = NanoFile(fp, f_cutoff=self.f_cutoff, search_window=self.search_window, \
                           fit_window=self.fit_window, calibrate=self.calibrate, verbose=self.verbose, \
                           apply_notch=self.apply_notch, config=self.config)
             nf.calibrate_pulse_amp(pulse_amps_1e, pulse_amps_V)
@@ -1137,7 +1242,9 @@ class NanoDataset:
         """
         impulses = []
         pulses = []
+        res_params = []
         recon_impulse_inds = []
+        quality_passed_list = []
 
         for i, fp in zip(self.file_inds, self.file_paths):
             if self.verbose:
@@ -1147,10 +1254,15 @@ class NanoDataset:
                           apply_notch=self.apply_notch, cal_factors=self.cal_factors, config=self.config)
             nf.compute_and_fit_psd(file_num=i, pdf=self.spectra_pdf)
             nf.search_all_data(file_num=i, max_windows=self.max_windows, freq_domain_pdf=self.freq_domain_pdf, \
-                               time_domain_pdf=self.time_domain_pdf)
+                               time_domain_pdf=self.time_domain_pdf, res_fit_pdf=self.res_fit_pdf, \
+                               noise_spectra_pdf=self.noise_spectra_pdf, quality_check_window=self.quality_check_window)
             impulses.append(nf.impulses.copy())
             pulses.append(nf.deconvolved_pulses.copy())
+            res_params.append(nf.resonance_params.copy())
             recon_impulse_inds.append(nf.recon_impulse_inds)
+            # Collect quality_passed if it exists (quality checks were performed)
+            if hasattr(nf, 'quality_passed'):
+                quality_passed_list.append(nf.quality_passed.copy())
 
             if i == 0:
                 self.freqs = nf.freqs.copy()
@@ -1160,5 +1272,9 @@ class NanoDataset:
 
         self.impulses = np.concatenate(impulses)
         self.pulses = np.concatenate(pulses)
+        self.resonance_params = np.concatenate(res_params)
         self.recon_impulse_inds = np.concatenate(recon_impulse_inds)
+        # Concatenate quality_passed arrays if any were collected
+        if quality_passed_list:
+            self.quality_passed = np.concatenate(quality_passed_list)
         self.close_pdfs()
