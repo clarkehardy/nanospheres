@@ -12,6 +12,7 @@ import scipy.signal as sig
 from scipy.optimize import curve_fit
 from scipy.special import voigt_profile
 from scipy.integrate import trapezoid
+from scipy.stats import chi2, norm
 
 from iminuit import Minuit
 from iminuit.cost import LeastSquares
@@ -609,7 +610,7 @@ class NanoFile:
         return times_win, z_win
 
     def search_all_data(self, file_num=None, max_windows=1000000, freq_domain_pdf=None, time_domain_pdf=None, \
-                        res_fit_pdf=None, noise_spectra_pdf=None, quality_check_window=None):
+                        res_fit_pdf=None, noise_spectra_pdf=None, quality_check_window=None, acc_pdf=None, rej_pdf=None):
         """Searches through all segments of the file and reconstructs the largest impulse in each.
 
         :param file_num: file number, defaults to None
@@ -620,8 +621,16 @@ class NanoFile:
         :type freq_domain_pdf: PdfPages, optional
         :param time_domain_pdf: PDF in which to save the time domain figure, defaults to None
         :type time_domain_pdf: PdfPages, optional
+        :param res_fit_pdf: PDF in which to save the resonance fit figure, defaults to None
+        :type res_fit_pdf: PdfPages, optional
+        :param noise_spectra_pdf: PDF in which to save the noise spectra figure, defaults to None
+        :type noise_spectra_pdf: PdfPages, optional
         :param quality_check_window: time window in seconds for quality checks, defaults to None
         :type quality_check_window: float, optional
+        :param acc_pdf: PDF in which to save accepted impulse plots, defaults to None
+        :type acc_pdf: PdfPages, optional
+        :param rej_pdf: PDF in which to save rejected impulse plots, defaults to None
+        :type rej_pdf: PdfPages, optional
         """
         search_win = int(self.search_window*self.f_samp)
         time_win = 5*search_win
@@ -713,10 +722,106 @@ class NanoFile:
         self.impulses = impulses
         self.deconvolved_pulses = deconvolved_pulses
         self.resonance_params = resonance_params
-        self.convert_to_keV()
         self.recon_impulse_inds = recon_impulse_inds
+        self.convert_to_keV()
+        self.compute_chi2(acc_pdf=acc_pdf, rej_pdf=rej_pdf)
+        self.impulse_rms = np.std(self.deconvolved_pulses, axis=1)
         self.pulse_times = pulse_times
         self.quality_passed = quality_passed
+
+    def compute_chi2(self, acc_pdf=None, rej_pdf=None, z_cut=3, max_plots=20):
+        """Compute the reduced chi-squared statistic for reconstructed waveforms given the provided template.
+
+        Computes the chi-squared statistic by comparing each deconvolved pulse waveform to a scaled
+        version of the template. Impulses are classified as accepted or rejected based on the p-value
+        of the chi-squared test. If PDFs are provided, plots are generated showing the waveform,
+        scaled template, and difference for accepted and rejected impulses.
+
+        :param acc_pdf: PDF in which to save accepted impulse plots, defaults to None
+        :type acc_pdf: PdfPages, optional
+        :param rej_pdf: PDF in which to save rejected impulse plots, defaults to None
+        :type rej_pdf: PdfPages, optional
+        :param z_cut: z-score cutoff for rejection threshold, defaults to 3
+        :type z_cut: float, optional
+        :param max_plots: maximum number of plots to generate per category (accepted/rejected), defaults to 20
+        :type max_plots: int, optional
+        """
+        scaled_templates = np.array(self.template)[None, :]*self.impulses[:, None]
+        template_half_len = len(self.template)//2
+        template_len = len(self.template)
+        
+        # Vectorized extraction of segments around recon_impulse_inds for each pulse
+        # Create array of offsets from center: [-half_len, ..., +half_len] (or close to it)
+        offsets = np.arange(template_len) - template_half_len
+        # Broadcast to create indices for all pulses: shape (n_pulses, template_len)
+        indices = self.recon_impulse_inds[:, None] + offsets[None, :]
+        # Use advanced indexing to extract segments: shape (n_pulses, template_len)
+        pulse_segments = self.deconvolved_pulses[np.arange(len(self.recon_impulse_inds))[:, None], indices]
+
+        chi_sq = np.sum((pulse_segments - scaled_templates)**2/self.resolution**2, axis=-1)
+
+        if acc_pdf and rej_pdf:
+            ndof = len(self.template) - 1
+            p_value = 1. - chi2.cdf(chi_sq, df=ndof)
+            alpha = (1 - norm.cdf(z_cut))*2
+            time_slice = np.arange(-len(self.template)//2, len(self.template)//2)*self.f_samp
+
+            plotted_rejected = 0
+            plotted_accepted = 0
+
+            for i, (im, pu) in enumerate(zip(self.impulses, self.deconvolved_pulses)):
+                chi_sq_i = chi_sq[i]
+                p_value_i = p_value[i]
+                
+                # Get segment around recon_impulse_inds for this pulse
+                center_ind = self.recon_impulse_inds[i]
+                start_ind = center_ind - template_half_len
+                end_ind = center_ind + len(self.template) - template_half_len
+                pu_segment = pu[start_ind:end_ind]
+
+                if p_value_i < alpha:
+                    # Rejected impulse
+                    if plotted_rejected >= max_plots:
+                        continue
+                    plotted_rejected += 1
+                    fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
+                    ax.plot(time_slice*1e6, pu_segment, label='Waveform')
+                    ax.plot(time_slice*1e6, np.array(self.template)*im, label='Scaled template')
+                    ax.plot(time_slice*1e6, pu_segment - np.array(self.template)*im, label='Difference')
+                    ax.text(0.95, 0.05, r'$\chi^2/\nu=$' + '{:.1f}/{:.0f}$=${:.3f}\n$p=${:.5f}'.format(chi_sq_i, ndof, chi_sq_i/ndof, p_value_i), \
+                            ha='right', va='bottom', transform=ax.transAxes)
+                    ax.set_xlabel(r'Time [$\mu$s]')
+                    ax.set_ylabel('Impulse [keV/c]')
+                    ax.legend(loc='lower left', fontsize=10)
+                    ax.set_title('Rejected impulse of {:.1f} keV/c'.format(im))
+                    rej_pdf.savefig(fig, dpi=150)
+                    fig.clf()
+                    plt.close()
+                    del fig, ax
+                    gc.collect()
+
+                else:
+                    # Accepted impulse
+                    if plotted_accepted >= max_plots:
+                        continue
+                    plotted_accepted += 1
+                    fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
+                    ax.plot(time_slice*1e6, pu_segment, label='Waveform')
+                    ax.plot(time_slice*1e6, np.array(self.template)*im, label='Scaled template')
+                    ax.plot(time_slice*1e6, pu_segment - np.array(self.template)*im, label='Difference')
+                    ax.text(0.95, 0.05, r'$\chi^2/\nu=$' + '{:.1f}/{:.0f}$=${:.3f}\n$p=${:.5f}'.format(chi_sq_i, ndof, chi_sq_i/ndof, p_value_i), \
+                            ha='right', va='bottom', transform=ax.transAxes)
+                    ax.set_xlabel(r'Time [$\mu$s]')
+                    ax.set_ylabel('Impulse [keV/c]')
+                    ax.legend(loc='lower left', fontsize=10)
+                    ax.set_title('Accepted impulse of {:.1f} keV/c'.format(im))
+                    acc_pdf.savefig(fig, dpi=150)
+                    fig.clf()
+                    plt.close()
+                    del fig, ax
+                    gc.collect()
+
+        self.chi2 = chi_sq
 
     def check_quality(self, z_data, t_window):
         """Perform quality checks on a segment of calibrated z data.
@@ -1002,14 +1107,8 @@ class NanoFile:
         # deconvolve to get force (Wiener filter picture) or get amplitude of signals matching template 
         # vs time (optimal filter picture)
         f_filt = np.fft.irfft(F_fft, n=len(z_win))#/np.sqrt(2)*len(z_win)
-
-        # lpf = sig.butter(3, self.f_cutoff[1], btype='lowpass', output='sos', fs=self.f_samp)
-        # f_filt = sig.sosfiltfilt(lpf, f_td)
-        # f_filt = np.copy(f_td)
         f_filt[:len(z_win)//4] = 0
         f_filt[-len(z_win)//4:] = 0
-        # f_td[:1000] = 0
-        # f_td[-1000:] = 0
 
         # find the maximum within the search window
         width = int(self.search_window*self.f_samp)
@@ -1147,10 +1246,13 @@ class NanoDataset:
             self.impulse_win_pdf = PdfPages(self.plot_path + '_impulse_window.pdf')
             self.spectra_pdf = PdfPages(self.plot_path + '_spectra.pdf')
             self.impulse_times_pdf = PdfPages(self.plot_path + '_impulse_times.pdf')
+            self.acc_pdf = PdfPages(self.plot_path + '_acc_pulses.pdf')
+            self.rej_pdf = PdfPages(self.plot_path + '_rej_pulses.pdf')
         else:
             self.time_domain_pdf, self.freq_domain_pdf, self.optimal_filter_pdf, self.res_fit_pdf, \
-            self.noise_spectra_pdf, self.impulse_win_pdf, self.spectra_pdf, self.impulse_times_pdf \
-                = None, None, None, None, None, None, None, None
+            self.noise_spectra_pdf, self.impulse_win_pdf, self.spectra_pdf, self.impulse_times_pdf, \
+            self.acc_pdf, self.rej_pdf \
+                = None, None, None, None, None, None, None, None, None, None
 
     def close_pdfs(self):
         """Close the PDF files.
@@ -1164,6 +1266,8 @@ class NanoDataset:
             self.impulse_win_pdf.close()
             self.spectra_pdf.close()
             self.impulse_times_pdf.close()
+            self.acc_pdf.close()
+            self.rej_pdf.close()
     
     def load_calibration_data(self, global_params=True, pulse_amps_1e=None, pulse_amps_V=None, \
                               noise=False):
@@ -1183,6 +1287,7 @@ class NanoDataset:
         pulses = []
         recon_impulse_inds = []
         pulse_times = []
+        meters_per_volt = []
         timestamps = []
 
         if self.verbose:
@@ -1206,6 +1311,7 @@ class NanoDataset:
             pulses.append(nf.deconvolved_pulses.copy())
             recon_impulse_inds.append(nf.recon_impulse_inds)
             pulse_times.append(nf.pulse_times)
+            meters_per_volt.append(nf.meters_per_volt)
             timestamps.append(nf.timestamp)
             if res_params is None:
                 res_params = [nf.resonance_params.copy()]
@@ -1223,28 +1329,26 @@ class NanoDataset:
         self.pulses = np.concatenate(pulses)
         self.recon_impulse_inds = np.concatenate(recon_impulse_inds)
         self.pulse_times = np.concatenate(pulse_times)
+        self.meters_per_volt = np.array(meters_per_volt)
         self.timestamps = np.array(timestamps)
         self.close_pdfs()
 
     def load_search_data(self):
         """Loads impulse search data files as NanoFile objects and extracts relevant data from them.
 
-        :param global_params: whether to use global resonance parameters (vs pulse-by-pulse), defaults to True
-        :type global_params: bool, optional
-        :param pulse_amps_1e: amplitudes of applied impulses in keV/c assuming 1e charge, defaults to None
-        :type pulse_amps_1e: list, optional
-        :param pulse_amps_V: amplitudes of applied impulses in V, defaults to None
-        :type pulse_amps_V: list, optional
-        :param noise: whether to use noise indices instead of impulse indices, defaults to False
-        :type noise: bool, optional
-        :param search: whether to search for the force peak in a window, defaults to True
-        :type search: bool, optional
+        Searches through all data files, reconstructs impulses, and computes chi-squared statistics
+        for quality assessment. Uses PDFs created in create_pdfs() to save plots of accepted and
+        rejected impulses based on chi-squared tests.
         """
         impulses = []
-        pulses = []
+        # pulses = []
         res_params = []
         recon_impulse_inds = []
+        impulse_rms = []
+        pulse_times = []
         quality_passed_list = []
+        timestamps = []
+        chi2 = []
 
         for i, fp in zip(self.file_inds, self.file_paths):
             if self.verbose:
@@ -1255,11 +1359,16 @@ class NanoDataset:
             nf.compute_and_fit_psd(file_num=i, pdf=self.spectra_pdf)
             nf.search_all_data(file_num=i, max_windows=self.max_windows, freq_domain_pdf=self.freq_domain_pdf, \
                                time_domain_pdf=self.time_domain_pdf, res_fit_pdf=self.res_fit_pdf, \
-                               noise_spectra_pdf=self.noise_spectra_pdf, quality_check_window=self.quality_check_window)
+                               noise_spectra_pdf=self.noise_spectra_pdf, quality_check_window=self.quality_check_window, \
+                               acc_pdf=self.acc_pdf, rej_pdf=self.rej_pdf)
             impulses.append(nf.impulses.copy())
-            pulses.append(nf.deconvolved_pulses.copy())
+            # pulses.append(nf.deconvolved_pulses.copy())
             res_params.append(nf.resonance_params.copy())
             recon_impulse_inds.append(nf.recon_impulse_inds)
+            impulse_rms.append(nf.impulse_rms.copy())
+            timestamps.append(nf.timestamp)
+            chi2.append(nf.chi2)
+            pulse_times.append(nf.pulse_times + timestamps[-1] - timestamps[0])
             # Collect quality_passed if it exists (quality checks were performed)
             if hasattr(nf, 'quality_passed'):
                 quality_passed_list.append(nf.quality_passed.copy())
@@ -1271,10 +1380,213 @@ class NanoDataset:
             gc.collect()
 
         self.impulses = np.concatenate(impulses)
-        self.pulses = np.concatenate(pulses)
+        # self.pulses = np.concatenate(pulses)
         self.resonance_params = np.concatenate(res_params)
         self.recon_impulse_inds = np.concatenate(recon_impulse_inds)
+        self.impulse_rms = np.concatenate(impulse_rms)
+        self.pulse_times = np.concatenate(pulse_times)
+        self.timestamps = np.array(timestamps)
+        self.chi2 = np.concatenate(chi2)
         # Concatenate quality_passed arrays if any were collected
         if quality_passed_list:
             self.quality_passed = np.concatenate(quality_passed_list)
         self.close_pdfs()
+
+    def save_to_hdf5(self, path=None):
+        """Save the NanoDataset object to an HDF5 file.
+        
+        Saves all configuration parameters as attributes and all data arrays as datasets.
+        This allows for perfect reinstantiation of the object using load_from_hdf5.
+        
+        :param path: path to the HDF5 file to save to. If None, uses self.path + '_processed.hdf5'
+        :type path: str, optional
+        """
+        if path is None:
+            path = self.path + '_processed.hdf5'
+        
+        with h5py.File(path, 'w') as f:
+            # Save configuration parameters as attributes
+            f.attrs['path'] = self.path
+            f.attrs['max_windows'] = self.max_windows
+            f.attrs['plot_path'] = self.plot_path if self.plot_path is not None else ''
+            f.attrs['f_cutoff'] = self.f_cutoff
+            f.attrs['search_window'] = self.search_window
+            f.attrs['fit_window'] = self.fit_window
+            f.attrs['calibrate'] = self.calibrate
+            f.attrs['cal_factors'] = self.cal_factors
+            f.attrs['verbose'] = self.verbose
+            f.attrs['apply_notch'] = self.apply_notch
+            f.attrs['quality_check_window'] = self.quality_check_window if self.quality_check_window is not None else -1.0
+            
+            # Save config as a string if it's a path, or as None if it's a dict (can't serialize dicts easily)
+            if self.config is None:
+                f.attrs['config'] = ''
+            elif isinstance(self.config, (str, Path)):
+                f.attrs['config'] = str(self.config)
+            else:
+                # If it's a dict, we'll save it as a YAML string representation
+                # For now, mark it as a dict that can't be easily restored
+                f.attrs['config'] = '__dict__'
+            
+            # Save file paths and indices as datasets
+            if hasattr(self, 'file_paths') and len(self.file_paths) > 0:
+                # Convert file_paths to a list of strings, h5py will handle encoding
+                file_paths_list = [str(fp) for fp in self.file_paths]
+                # Use special_dtype for variable-length strings
+                dt = h5py.special_dtype(vlen=str)
+                f.create_dataset('file_paths', data=file_paths_list, dtype=dt)
+                f.create_dataset('file_inds', data=self.file_inds)
+            
+            # Save data arrays as datasets (only if they exist)
+            if hasattr(self, 'impulses'):
+                f.create_dataset('impulses', data=self.impulses, compression='gzip')
+            
+            if hasattr(self, 'resonance_params'):
+                f.create_dataset('resonance_params', data=self.resonance_params, compression='gzip')
+            
+            if hasattr(self, 'recon_impulse_inds'):
+                f.create_dataset('recon_impulse_inds', data=self.recon_impulse_inds, compression='gzip')
+            
+            if hasattr(self, 'pulse_times'):
+                f.create_dataset('pulse_times', data=self.pulse_times, compression='gzip')
+            
+            if hasattr(self, 'timestamps'):
+                f.create_dataset('timestamps', data=self.timestamps, compression='gzip')
+            
+            if hasattr(self, 'freqs'):
+                f.create_dataset('freqs', data=self.freqs, compression='gzip')
+            
+            # Optional attributes from load_calibration_data
+            if hasattr(self, 'pulses'):
+                f.create_dataset('pulses', data=self.pulses, compression='gzip')
+            
+            if hasattr(self, 'meters_per_volt'):
+                f.create_dataset('meters_per_volt', data=self.meters_per_volt, compression='gzip')
+            
+            if hasattr(self, 'pulse_amp_keV'):
+                f.attrs['pulse_amp_keV'] = self.pulse_amp_keV
+            
+            # Optional attributes from load_search_data
+            if hasattr(self, 'impulse_rms'):
+                f.create_dataset('impulse_rms', data=self.impulse_rms, compression='gzip')
+            
+            if hasattr(self, 'chi2'):
+                f.create_dataset('chi2', data=self.chi2, compression='gzip')
+            
+            if hasattr(self, 'quality_passed'):
+                f.create_dataset('quality_passed', data=self.quality_passed, compression='gzip')
+            
+            # Optional attributes that might be set externally
+            if hasattr(self, 'template'):
+                f.create_dataset('template', data=self.template, compression='gzip')
+            
+            if hasattr(self, 'resolution'):
+                f.attrs['resolution'] = self.resolution
+        
+    def load_from_hdf5(self, path=None):
+        """Load a NanoDataset object from an HDF5 file.
+        
+        Reinstantiates the object with all saved configuration parameters and data arrays.
+        This is the inverse operation of save_to_hdf5.
+        
+        :param path: path to the HDF5 file to load from. If None, uses self.path + '_processed.hdf5'
+        :type path: str, optional
+        """
+        if path is None:
+            path = self.path + '_processed.hdf5'
+        
+        with h5py.File(path, 'r') as f:
+            # Load configuration parameters from attributes
+            self.path = f.attrs['path'].decode('utf-8') if isinstance(f.attrs['path'], bytes) else f.attrs['path']
+            self.max_windows = int(f.attrs['max_windows'])
+            plot_path_str = f.attrs['plot_path'].decode('utf-8') if isinstance(f.attrs['plot_path'], bytes) else f.attrs['plot_path']
+            self.plot_path = plot_path_str if plot_path_str else None
+            self.f_cutoff = list(f.attrs['f_cutoff'])
+            self.search_window = float(f.attrs['search_window'])
+            self.fit_window = float(f.attrs['fit_window'])
+            self.calibrate = bool(f.attrs['calibrate'])
+            self.cal_factors = list(f.attrs['cal_factors'])
+            self.verbose = bool(f.attrs['verbose'])
+            self.apply_notch = bool(f.attrs['apply_notch'])
+            quality_check_window_val = float(f.attrs['quality_check_window'])
+            self.quality_check_window = quality_check_window_val if quality_check_window_val >= 0 else None
+            
+            # Load config
+            config_str = f.attrs['config'].decode('utf-8') if isinstance(f.attrs['config'], bytes) else f.attrs['config']
+            if config_str == '':
+                self.config = None
+            elif config_str == '__dict__':
+                # Config was a dict, can't restore it perfectly
+                self.config = None
+            else:
+                self.config = config_str
+            
+            # Load file paths and indices
+            if 'file_paths' in f:
+                file_paths_data = f['file_paths'][:]
+                # Handle both variable-length strings and fixed-length byte strings
+                # Convert to list of strings, handling bytes if necessary
+                file_paths_list = []
+                for fp in file_paths_data:
+                    if isinstance(fp, bytes):
+                        file_paths_list.append(fp.decode('utf-8'))
+                    else:
+                        file_paths_list.append(str(fp))
+                self.file_paths = np.array(file_paths_list)
+                self.file_inds = f['file_inds'][:]
+            else:
+                # If file_paths not saved, try to reconstruct from path
+                self.file_paths = glob(self.path + '_*.hdf5')
+                self.file_inds = np.array([int(fp.split('_')[-1].split('.hdf5')[0]) for fp in self.file_paths])
+                sort_inds = np.argsort(self.file_inds)
+                self.file_paths = np.array(self.file_paths)[sort_inds]
+                self.file_inds = self.file_inds[sort_inds]
+            
+            # Load data arrays
+            if 'impulses' in f:
+                self.impulses = f['impulses'][:]
+            
+            if 'resonance_params' in f:
+                self.resonance_params = f['resonance_params'][:]
+            
+            if 'recon_impulse_inds' in f:
+                self.recon_impulse_inds = f['recon_impulse_inds'][:]
+            
+            if 'pulse_times' in f:
+                self.pulse_times = f['pulse_times'][:]
+            
+            if 'timestamps' in f:
+                self.timestamps = f['timestamps'][:]
+            
+            if 'freqs' in f:
+                self.freqs = f['freqs'][:]
+            
+            # Optional attributes from load_calibration_data
+            if 'pulses' in f:
+                self.pulses = f['pulses'][:]
+            
+            if 'meters_per_volt' in f:
+                self.meters_per_volt = f['meters_per_volt'][:]
+            
+            if 'pulse_amp_keV' in f.attrs:
+                self.pulse_amp_keV = float(f.attrs['pulse_amp_keV'])
+            
+            # Optional attributes from load_search_data
+            if 'impulse_rms' in f:
+                self.impulse_rms = f['impulse_rms'][:]
+            
+            if 'chi2' in f:
+                self.chi2 = f['chi2'][:]
+            
+            if 'quality_passed' in f:
+                self.quality_passed = f['quality_passed'][:]
+            
+            # Optional attributes that might be set externally
+            if 'template' in f:
+                self.template = f['template'][:]
+            
+            if 'resolution' in f.attrs:
+                self.resolution = float(f.attrs['resolution'])
+        
+        # Recreate PDFs (they won't be functional, but the structure is preserved)
+        self.create_pdfs()
