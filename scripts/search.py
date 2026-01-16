@@ -123,7 +123,7 @@ def process_dataset(dataset_ind):
     print('Starting dataset ' + dataset + '/' + dataset_dict[dataset][0])
 
     nd = dp.NanoDataset(dataset + '/' + dataset_dict[dataset][0], plot_path, verbose=True, max_files=max_files, \
-                        config=config, quality_check_window=1e-2)
+                        config=config, ds_factor=10)
     nd.load_search_data()
     nd.save_to_hdf5()
 
