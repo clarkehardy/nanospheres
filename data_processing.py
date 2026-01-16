@@ -88,6 +88,7 @@ class NanoFile:
         self.d_sphere_nm = d_sphere_nm
         self.drive_freq = None
         self.drive_amp = None
+        self.meters_per_volt = None
         if config:
             self.load_config(config)
         V_ns = (4/3.)*np.pi*(self.d_sphere_nm*1e-9/2.)**3
@@ -292,7 +293,8 @@ class NanoFile:
         if self.calibrate:
             self.meters_per_volt = self.calibrate_spectrum(Pxx_mon_raw, p[0], p[1], p[3])
         else:
-            self.meters_per_volt = 5e-8 # default value; placeholder for now
+            if self.meters_per_volt is None:
+                self.meters_per_volt = 5e-8 # default value; placeholder for now
 
         # apply calibration factor to z data
         self.z_calibrated = self.z_filtered * self.meters_per_volt
@@ -684,14 +686,18 @@ class NanoFile:
                     impulse_num=1, file_num=file_num)
 
             # only plot for one iteration
-            if i == 0:
+            if i == num_to_plot:
                 res_fit_pdf = None
                 noise_spectra_pdf = None
                 optimal_filter_pdf = None
 
             # Map search windows to fit windows
             fit_window_start = i * fit_window_samples
-            fit_window_end = (i + 1) * fit_window_samples
+            # Extend the last fit window to cover any remaining samples
+            if i == num_optimal_filters - 1:
+                fit_window_end = len(self.times)
+            else:
+                fit_window_end = (i + 1) * fit_window_samples
             
             # Find search windows whose start indices fall within this fit window
             search_window_starts = np.arange(z_wins_array.shape[0]) * search_win
