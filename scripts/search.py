@@ -29,22 +29,19 @@ parser.add_argument('--drive-path', type=str, default='/Users/clarke/Data/',
                     help='Path to data drive (default: /Users/clarke/Data/)')
 parser.add_argument('--sphere-date', type=str, default='20251212',
                     help='Sphere date identifier (default: 20251212)')
-parser.add_argument('--config-ind', type=int, default=0,
-                    help='Index of config directory to use (default: 0)')
+parser.add_argument('--config-path', type=str, default='',
+                    help='Path to the config file to be used')
 args = parser.parse_args()
 
 max_files = args.max_files
 drive_path = args.drive_path
 sphere_date = args.sphere_date
-config_ind = args.config_ind
+config_path = args.config_path
 
 if not os.path.exists(drive_path):
     print('Error: check that the external drive is plugged in!')
 
-# Load config from local configs directory
-config_dirs = glob(f'configs/sphere_{sphere_date}/*')
-
-with open(config_dirs[config_ind] + '/config.yaml', 'r') as f:
+with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 config['calibrate'] = False
@@ -112,6 +109,8 @@ def half_gaus(x, A, sigma):
     return A*np.exp(-x**2/2/sigma**2)
 
 def process_dataset(dataset_ind):
+    # Apply style in worker process (not inherited from main process)
+    plt.style.use('clarke-default')
 
     dataset = list(dataset_dict.keys())[dataset_ind]
 

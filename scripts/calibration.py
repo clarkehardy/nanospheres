@@ -106,6 +106,9 @@ def quad(x, a, b, c):
     return a*x**2 + b*x + c
 
 def process_dataset(dataset_ind):
+    # Apply style in worker process (not inherited from main process)
+    plt.style.use('clarke-default')
+
     dataset = list(datasets.keys())[dataset_ind]
 
     if 'electric_calibration' in dataset:
