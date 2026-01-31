@@ -19,6 +19,8 @@ from iminuit.cost import LeastSquares
 
 c = 299792458.  # speed of light, m/s
 e = 1.602176634e-19 # unit charge, C
+hbar = 1.054571817e-34 # reduced Planck's constant, J.s
+kB = 1.380649e-23 # Boltzmann's constant, J/K
 
 def abs_susc2(omega, A, omega_0, gamma):
     """Magnitude of the mechanical susceptibility of the trapped nanosphere squared.
@@ -94,6 +96,7 @@ class NanoFile:
         V_ns = (4/3.)*np.pi*(self.d_sphere_nm*1e-9/2.)**3
         rho_silica = 2.65e3 # density of silica, kg/m^3
         self.mass_sphere = rho_silica*V_ns # mass of the sphere in kg
+        self.Efield = 79. # V/m (when 1 V is applied to lens holder 2)
         self.load_file()
 
     def load_config(self, config):
@@ -176,6 +179,28 @@ class NanoFile:
 
         return p_sens
 
+    def compute_phonon_occupancy(self, Pxx, freqs, freq_range = [30e3, 70e3]):
+        """Integrates over the resonance to compute the average phonon occupancy
+        in the z mode.
+
+        :param Pxx: the z power spectral density
+        :type Pxx: numpy.ndarray
+        :param freqs: the frequency array corresponding to Fxx
+        :type freqs: numpy.ndarray
+        :param freq_range: frequency range for sensitivity calculation in Hz, defaults to [20e3, 100e3]
+        :type freq_range: list, optional
+        :return: average number of phonons
+        :rtype: float
+        """
+        ind_1 = np.argmin(np.abs(freqs - freq_range[0]))
+        ind_2 = np.argmin(np.abs(freqs - freq_range[1]))
+        exp_z2 = trapezoid(Pxx[ind_1:ind_2], freqs[ind_1:ind_2])
+        
+        n = self.mass_sphere * self.omega_0 * exp_z2 / hbar
+        T_eff = n * self.omega_0 * hbar / kB
+
+        return n, T_eff
+
     def calibrate_spectrum(self, Pxx_mon_raw, *params):
         """Calibrate the position spectrum to Newtons
 
@@ -185,8 +210,6 @@ class NanoFile:
 
         if self.verbose:
             print('  Calibrating volts to meters...')
-
-        Efield = 79. # V/m (when 1 V is applied to lens holder 2)
 
         if self.mon_raw is not None:
             f_mon = self.freqs[np.argmax(Pxx_mon_raw)]
@@ -202,22 +225,22 @@ class NanoFile:
         drive = sig.sosfiltfilt(bp, force_applied)
         resp = sig.sosfiltfilt(bp, self.z_raw)
 
-        # get in-phase and quadrature components of response
+        # demodulate the response
         z = sig.hilbert(drive)
         phi = np.unwrap(np.angle(z))
         i_raw = resp*np.cos(phi)
         q_raw = resp*np.sin(phi)
         
-        # low-pass filter the demodulated data streams
+        # construct a low pass filter for the baseband data streams
         f_lpf = 1e2
         lpf = sig.butter(4, f_lpf, btype='low', output='sos', fs=self.f_samp)
 
-        # demodulate the response
+        # low pass filter the demodulated response
         i_filt = 2*sig.sosfiltfilt(lpf, i_raw)
         q_filt = 2*sig.sosfiltfilt(lpf, q_raw)
         R = i_filt + 1j*q_filt
 
-        # demodulate the drive
+        # low pass filter the demodulated drive
         i_drive = 2*sig.sosfiltfilt(lpf, drive*np.cos(phi))
         q_drive = 2*sig.sosfiltfilt(lpf, drive*np.sin(phi))
         D = i_drive + 1j*q_drive
@@ -226,18 +249,18 @@ class NanoFile:
             self.drive_amp = np.mean(np.abs(D))
 
         # conversion factor from volts to meters
-        meters_per_volt = np.mean(self.n_charges*e*Efield*np.abs(D/R))*np.abs(self.susceptibility(2*np.pi*f_mon))
+        meters_per_volt = np.mean(self.n_charges*e*self.Efield*np.abs(D/R))*np.abs(self.susceptibility(2*np.pi*f_mon))
 
         if self.verbose:
             print('    Mass of the nanosphere: \t\t{:.3e} kg'.format(self.mass_sphere))
             print('    Number of charges on the sphere: \t{}'.format(int(self.n_charges)))
-            print('    Electric field per volt applied: \t{:.1f} V/m'.format(Efield))
+            print('    Electric field per volt applied: \t{:.1f} V/m'.format(self.Efield))
             print('    Trap resonant frequency: \t\t{:.1f} kHz'.format(params[1]*1e-3/2/np.pi))
             print('    Drive signal from demodulation: \t{:.3f} V'.format(np.mean(np.abs(D))))
-            print('    Applied force from demodulation: \t{:.3e} N'.format(self.n_charges*e*Efield*np.mean(np.abs(D))))
+            print('    Applied force from demodulation: \t{:.3e} N'.format(self.n_charges*e*self.Efield*np.mean(np.abs(D))))
             print('    Sensor response from demodulation: \t{:.3e} V'.format(np.mean(np.abs(R))))
             print('    Susceptibility at {:.1f} kHz drive: \t{:.3e} m/V'.format(f_mon*1e-3, np.abs(self.susceptibility(2*np.pi*f_mon))))
-            print('    Nanosphere response amplitude: \t{:.3e} m'.format(self.n_charges*e*Efield*np.mean(np.abs(D))*np.abs(self.susceptibility(2*np.pi*f_mon))))
+            print('    Nanosphere response amplitude: \t{:.3e} m'.format(self.n_charges*e*self.Efield*np.mean(np.abs(D))*np.abs(self.susceptibility(2*np.pi*f_mon))))
             print('    Position calibration factor: \t{:.3e} m/V'.format(meters_per_volt))
 
         return meters_per_volt
@@ -300,6 +323,14 @@ class NanoFile:
             if self.meters_per_volt is None:
                 self.meters_per_volt = 5e-8 # default value; placeholder for now
 
+        # store the bandpass gain at the monitoring tone
+        if self.drive_freq:
+            worN = [self.drive_freq]
+        else:
+            worN = [np.argmin(np.abs(self.freqs - 1e5)) + np.argmax(Pxx_z_raw[self.freqs > 1e5])]
+        _, h = sig.freqz_sos(self.bandpass, worN=worN, fs=self.f_samp)
+        self.bandpass_gain = np.abs(h[0])**2 # squared because we use sosfiltfilt which applies the filter twice
+
         # apply calibration factor to z data
         self.z_calibrated = self.z_filtered * self.meters_per_volt
 
@@ -311,23 +342,25 @@ class NanoFile:
         if pdf:
             Fxx = Pxx_z_filt*(spectrum_to_density*self.meters_per_volt/np.abs(self.susceptibility(2*np.pi*self.freqs)))**2
             p_sens = self.compute_sensitivity(Fxx, self.freqs)
+            scaled_susc = np.abs(susc(2*np.pi*self.freqs, 1/self.mass_sphere, self.omega_0, self.gamma)) \
+                          *p[0]*self.mass_sphere*np.sqrt(2*self.omega_0**2*self.gamma/np.pi)*spectrum_to_density
+            above_noise = scaled_susc > np.sqrt(noise_floor/2)*spectrum_to_density # division by 2 to get -3dB point
+            effective_bw = 1e-3*self.freqs[above_noise][-1] - 1e-3*self.freqs[above_noise][0]
+            n_avg, T_eff = self.compute_phonon_occupancy(Pxx_z_filt*(spectrum_to_density*self.meters_per_volt)**2, self.freqs, \
+                                                         [self.freqs[above_noise][0], self.freqs[above_noise][-1]])
 
             if self.pulse_amp_keV:
                 title = '{:.0f} keV/c impulse, file {}'.format(self.pulse_amp_keV, file_num + 1)
             else:
                 title = 'File {}'.format(file_num + 1)
-            scaled_susc = np.abs(susc(2*np.pi*self.freqs, 1/self.mass_sphere, self.omega_0, self.gamma)) \
-                          *p[0]*self.mass_sphere*np.sqrt(2*self.omega_0**2*self.gamma/np.pi)*spectrum_to_density
             fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
             ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_raw)*spectrum_to_density, alpha=1.0, label='$z$ raw')
             ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_filt)*spectrum_to_density, alpha=1.0, label='$z$ filtered')
             ax.semilogy(self.freqs*1e-3, np.sqrt((p[0]**2*voigt_profile(2*np.pi*self.freqs - p[1], p[2], p[3]) \
                         + noise_floor))*spectrum_to_density, alpha=1.0, lw=1.0, label='Voigt fit', zorder=100)
-            ax.semilogy(self.freqs*1e-3, scaled_susc, alpha=1.0, label=r'Scaled $\chi$')
-            ax.axhline(np.sqrt(noise_floor)*spectrum_to_density, color='C4', label='Noise floor')
-            above_noise = scaled_susc > np.sqrt(noise_floor/2)*spectrum_to_density # division by 2 to get -3dB point
-            effective_bw = 1e-3*self.freqs[above_noise][-1] - 1e-3*self.freqs[above_noise][0]
-            ax.text(p[1]*1e-3/2/np.pi, 0.7*np.sqrt(noise_floor)*spectrum_to_density, \
+            ax.semilogy(self.freqs*1e-3, scaled_susc, alpha=1.0, lw=1.0, label=r'Scaled $\chi$')
+            ax.axhline(np.sqrt(noise_floor)*spectrum_to_density, lw=1.0, color='C4', label='Noise floor')
+            ax.text(p[1]*1e-3/2/np.pi, 0.9*np.sqrt(noise_floor)*spectrum_to_density, \
                     '{:.1f} kHz\n effective bandwidth'.format(effective_bw), ha='center', va='top')
             ax.set_title(title)
             ax.set_xlabel('Frequency [kHz]')
@@ -373,6 +406,7 @@ class NanoFile:
             ax.set_ylabel(r'Calibrated ASD [$\mathrm{m/\sqrt{Hz}}$]')
             ax.set_xlim([20, 100])
             ax.set_ylim([1e-14, 1e-9])
+            ax.text(0.03, 0.97, '$n={:.0f}$ phonons,\n$T={:.0f}$ mK'.format(n_avg, T_eff*1e3), ha='left', va='top', transform=ax.transAxes)
             ax.grid(which='both')
             pdf.savefig(fig, dpi=150)
             fig.clf()
@@ -675,6 +709,7 @@ class NanoFile:
         times_wins_array = np.lib.stride_tricks.sliding_window_view(self.times, window_shape=time_win)[::search_win]
 
         resonance_params = np.empty((z_wins_array.shape[0], 3), dtype=float)
+        cal_facs = np.empty(z_wins_array.shape[0], dtype=float)
         optimal_filters = np.empty((z_wins_array.shape[0], time_win//2 + 1), dtype=complex)
 
         for i in range(num_optimal_filters):
@@ -683,8 +718,8 @@ class NanoFile:
                 print('Computing optimal filter for window {} of {}...'.format(i + 1, num_optimal_filters))
 
             z_fit_win = self.z_calibrated[i*fit_window_samples:(i + 1)*fit_window_samples]
-            params, success, C = self.fit_susceptibility(z_fit_win, file_num=file_num, impulse_num=i, \
-                                                         res_fit_pdf=res_fit_pdf, noise_spectra_pdf=noise_spectra_pdf)
+            params, success, C, cal_fac = self.fit_susceptibility(z_fit_win, file_num=file_num, impulse_num=i, \
+                                                                  res_fit_pdf=res_fit_pdf, noise_spectra_pdf=noise_spectra_pdf)
 
             if success:
                 current_params = params
@@ -716,6 +751,7 @@ class NanoFile:
             # Assign the optimal filter to all search windows in this fit window
             optimal_filters[mask] = optimal_filter
             resonance_params[mask] = current_params
+            cal_facs[mask] = cal_fac
         
         deconvolved_pulses, impulses, imp_inds, imp_times = self.compute_impulse(
             times_wins_array, z_wins_array, optimal_filters, file_num=file_num, \
@@ -726,6 +762,7 @@ class NanoFile:
         self.impulses = impulses
         self.deconvolved_pulses = deconvolved_pulses
         self.resonance_params = resonance_params
+        self.cal_facs = cal_facs
         self.recon_impulse_inds = imp_inds
         self.convert_to_keV()
         self.compute_chi2(acc_pdf=acc_pdf, rej_pdf=rej_pdf)
@@ -864,17 +901,19 @@ class NanoFile:
         recon_impulse_inds = []
         pulse_times = []
         resonance_params = []
+        cal_facs = []
         fit_success = []
 
         for i, ind in enumerate(impulse_inds):
             if self.verbose:
                 print('    -> Computing impulse for kick at t={:.5f} seconds...'.format(self.times[ind]))
             times_win, z_win = self.get_time_window(ind, t_window=self.fit_window, centered=False)
-            p, success, C = self.fit_susceptibility(z_win, file_num, i, res_fit_pdf, noise_spectra_pdf)
+            p, success, C, cal_fac = self.fit_susceptibility(z_win, file_num, i, res_fit_pdf, noise_spectra_pdf)
             if not success:
                 print(f'Fit for impulse {i + 1} failed!')
             resonance_params.append(p)
             fit_success.append(success)
+            cal_facs.append(cal_fac)
             times_win, z_win = self.get_time_window(ind, t_window=5*self.search_window, centered=True, \
                                                     file_num=file_num, impulse_num=i, pdf=impulse_win_pdf, \
                                                     end_mode='pad')
@@ -889,6 +928,7 @@ class NanoFile:
         
         self.resonance_params = np.array(resonance_params)
         self.fit_success = np.array(fit_success)
+        self.cal_facs = np.array(cal_facs)
         self.impulses = np.array(impulses)
         self.deconvolved_pulses = np.array(deconvolved_pulses)
         self.recon_impulse_inds = np.array(recon_impulse_inds)
@@ -906,12 +946,13 @@ class NanoFile:
         :type impulse_num: int, optional
         :param pdf: PDF in which to save the susceptiblity fit, defaults to None
         :type pdf: PdfPages, optional
-        :return: best-fit parameters for the resonance and a success flag
+        :return: best-fit parameters for the resonance, success flag, and the relative calibration constant
         :rtype: tuple
         """
         bin_size_hz = 50
+        nperseg = int(self.f_samp)//bin_size_hz
         freq_filt, Pxx_filt = sig.welch(z_win, fs=self.f_samp, window=self.window_func, \
-                                        noverlap=0, nperseg=int(self.f_samp)//bin_size_hz)
+                                        noverlap=0, nperseg=nperseg)
 
         bw = 10*bin_size_hz
         peak_ind = np.argmax(Pxx_filt)
@@ -934,20 +975,21 @@ class NanoFile:
         else:
             success = False
 
-        # # determine the calibration factor
-        # if self.drive_amp and self.drive_freq:
-        #     resp = Pxx_filt[np.argmin(np.abs(freq_filt - self.drive_freq))]
-        #     cal_fac = np.mean(self.n_charges*e*79*np.abs(self.drive_amp/resp))*np.abs(self.susceptibility(2*np.pi*self.drive_freq))
-        # else:
-        #     # if no data provided, just assume a 1 V drive and 1 e charge and scale accordingly
-        #     freq_filt, Pxx_filt = sig.welch(z_win, fs=self.f_samp, window=self.window_func, nperseg=nperseg, scaling='spectrum')
-        #     drive = 1.
-        #     n_charges = 1.
-        #     ind_100k = np.argmin(np.abs(freq_filt - 1e5))
-        #     drive_ind = ind_100k + np.argmax(Pxx_filt[freq_filt > 1e5])
-        #     drive_freq = freq_filt[drive_ind]
-        #     resp = np.sqrt(Pxx_filt[drive_ind])
-        #     cal_fac = np.mean(n_charges*e*79*np.abs(drive/resp))*np.abs(self.susceptibility(2*np.pi*drive_freq))
+        # determine the calibration factor
+        window_s1 = np.sum(sig.get_window(self.window_func, nperseg))
+        window_s2 = np.sum(sig.get_window(self.window_func, nperseg)**2)
+        spectrum_to_density = window_s1/np.sqrt(window_s2*self.f_samp)
+        if self.drive_amp and self.drive_freq:
+            resp = np.sqrt(2*Pxx_filt[np.argmin(np.abs(freq_filt - self.drive_freq))])/spectrum_to_density/self.bandpass_gain
+            cal_fac = np.mean(self.n_charges*e*self.Efield*np.abs(self.drive_amp/resp))*np.abs(self.susceptibility(2*np.pi*self.drive_freq))
+        else:
+            drive = 1.
+            n_charges = 1.
+            ind_100k = np.argmin(np.abs(freq_filt - 1e5))
+            drive_ind = ind_100k + np.argmax(Pxx_filt[freq_filt > 1e5])
+            drive_freq = freq_filt[drive_ind]
+            resp = np.sqrt(2*Pxx_filt[drive_ind])/spectrum_to_density/self.bandpass_gain
+            cal_fac = np.mean(n_charges*e*self.Efield*np.abs(drive/resp))*np.abs(self.susceptibility(2*np.pi*drive_freq))
 
         if res_fit_pdf:
             plot_freq = np.linspace(freq_filt[peak_ind - 2*(ind2 - ind1)], freq_filt[peak_ind + 2*(ind2 - ind1)], 1000)
@@ -977,6 +1019,9 @@ class NanoFile:
 
         if noise_spectra_pdf:
             Fxx = np.abs(np.sqrt(Pxx_filt)/susc(2*np.pi*freq_filt, 1/self.mass_sphere, *p[1:]))**2
+            above_noise = Pxx_filt > C*self.amplitude**2*self.mass_sphere**2/2. # division by 2 to get -3dB point
+            n_avg, T_eff = self.compute_phonon_occupancy(Pxx_filt, freq_filt, \
+                                                         [freq_filt[above_noise][0], freq_filt[above_noise][-1]])
             fig, ax = plt.subplots(1, 2, figsize=(8, 4), sharex=True, layout='constrained')
             ax[0].semilogy(freq_filt*1e-3, np.sqrt(Pxx_filt))
             ax[1].semilogy(freq_filt*1e-3, np.sqrt(Fxx))
@@ -985,6 +1030,8 @@ class NanoFile:
             ax[0].set_xlim([20, 100])
             ax[0].set_ylim([1e-14, 1e-9])
             ax[1].set_ylim([1e-21, 1e-18])
+            ax[0].text(0.03, 0.97, '$n={:.0f}$ phonons,\n$T={:.0f}$ mK'.format(n_avg, T_eff*1e3), ha='left', va='top', \
+                       transform=ax[0].transAxes)
             ax[1].text(0.05, 0.95, '$\\Delta p={:.1f}$ keV/c'.format(self.compute_sensitivity(Fxx, freq_filt)), \
                        ha='left', va='top', transform=ax[1].transAxes)
             for i in range(2):
@@ -1000,7 +1047,7 @@ class NanoFile:
             del fig, ax
             gc.collect()
 
-        return p, success, C
+        return p, success, C, cal_fac
 
     def build_optimal_filter(self, window_len, params=None, C=None, file_num=None, impulse_num=None, pdf=None):
         """Build the optimal filter to deconvolve the response of the oscillator from the position data.
@@ -1041,26 +1088,30 @@ class NanoFile:
 
             fig, ax = plt.subplots(2, figsize=(6, 6), layout='constrained')
             sort_inds = np.concat((np.arange(irfft_len//2, irfft_len), np.arange(0, irfft_len//2)))
-            ax[0].plot(time_array*1e6, irfft_output[sort_inds], \
-                       label='$C$ from noise')
-            ax[0].plot(time_array*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 10*C))[sort_inds], \
-                       label=r'$C\times10$')
-            ax[0].plot(time_array*1e6, np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 0.1*C))[sort_inds], \
-                       label=r'$C/10$')
-            ax[0].set_xlim([-20, 20])
+            ax[0].plot(time_array*1e6, irfft_output[sort_inds]/irfft_output[0], \
+                       label='$C$')
+            irfft_scaled = np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 3*C))
+            irfft_scaled = irfft_scaled[sort_inds]/irfft_scaled[0]
+            ax[0].plot(time_array*1e6, irfft_scaled, label=r'$C\times3$')
+            irfft_scaled = np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 0.333*C))
+            irfft_scaled = irfft_scaled[sort_inds]/irfft_scaled[0]
+            ax[0].plot(time_array*1e6, irfft_scaled, label=r'$C/3$')
+            ax[0].set_xlim([-25, 25])
             ax[0].set_xlabel(r'Time [$\mu$s]')
             ax[0].set_ylabel('Filter magnitude [au]')
             ax[0].legend()
+            ax[0].grid()
             if self.pulse_amp_keV:
                 ax[0].set_title('{:.0f} keV/c impulse, file {}, impulse {}'.format(self.pulse_amp_keV, file_num + 1, impulse_num + 1))
             else:
                 ax[0].set_title('File {}, window {}'.format(file_num + 1, impulse_num + 1))
-            ax[1].semilogy(freq_fft*1e-3, np.abs(optimal))
-            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 10*C)))
-            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 0.1*C)))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(optimal)/np.amax(np.abs(optimal)))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 3*C))/np.amax(np.abs(optimal)))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 0.333*C))/np.amax(np.abs(optimal)))
             ax[1].set_xlabel('Frequency [kHz]')
             ax[1].set_ylabel('Filter magnitude [au]')
             ax[1].set_xlim([0, 1e2])
+            ax[1].grid()
             pdf.savefig(fig, dpi=150)
             fig.clf()
             plt.close()
@@ -1135,7 +1186,7 @@ class NanoFile:
         # Prepare for plotting loop
         if is_1d:
             plot_indices = [0]  # Single iteration for 1D
-            plot_labels = [impulse_num]  # Use impulse_num for labeling
+            plot_labels = [impulse_num + 1]  # Use impulse_num for labeling
         else:
             plot_indices = np.arange(min(num_to_plot, num_windows))
             plot_labels = plot_indices + 1  # Window numbers start at 1
@@ -1332,6 +1383,7 @@ class NanoDataset:
         fit_success = []
         pulses = []
         recon_impulse_inds = []
+        cal_facs = []
         pulse_times = []
         meters_per_volt = []
         timestamps = []
@@ -1370,6 +1422,7 @@ class NanoDataset:
             pulse_times.append(nf.pulse_times)
             impulse_rms.append(nf.impulse_rms)
             res_params.append(nf.resonance_params)
+            cal_facs.append(nf.cal_facs)
             fit_success.append(nf.fit_success)
             if i == 0:
                 self.pulse_amp_keV = nf.pulse_amp_keV
@@ -1380,6 +1433,7 @@ class NanoDataset:
 
         self.impulses = np.concatenate(impulses)
         self.resonance_params = np.concatenate(res_params)
+        self.cal_facs = np.concatenate(cal_facs)
         self.fit_success = np.concatenate(fit_success)
         self.pulses = np.concatenate(pulses)
         self.recon_impulse_inds = np.concatenate(recon_impulse_inds)
@@ -1399,6 +1453,7 @@ class NanoDataset:
         """
         impulses = []
         res_params = []
+        cal_facs = []
         recon_impulse_inds = []
         impulse_rms = []
         pulse_times = []
@@ -1428,6 +1483,7 @@ class NanoDataset:
             nf.search_all_data(file_num=i, pdfs=pdfs)
             impulses.append(nf.impulses)
             res_params.append(nf.resonance_params)
+            cal_facs.append(nf.cal_facs)
             recon_impulse_inds.append(nf.recon_impulse_inds)
             impulse_rms.append(nf.impulse_rms)
             timestamps.append(nf.timestamp)
@@ -1443,6 +1499,7 @@ class NanoDataset:
 
         self.impulses = np.concatenate(impulses)
         self.resonance_params = np.concatenate(res_params)
+        self.cal_facs = np.concatenate(cal_facs)
         self.recon_impulse_inds = np.concatenate(recon_impulse_inds)
         self.impulse_rms = np.concatenate(impulse_rms)
         self.pulse_times = np.concatenate(pulse_times)
