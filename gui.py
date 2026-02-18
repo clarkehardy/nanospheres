@@ -16,6 +16,7 @@ import sys
 import glob
 import time
 import traceback
+import yaml
 
 import matplotlib
 matplotlib.use('QtAgg')
@@ -154,13 +155,14 @@ class NanosphereGUI(QMainWindow):
 
         self._cfg: dict[str, QLineEdit] = {}
         fields = [
-            ("f_cutoff low (Hz)",  "f_low",         "20000"),
-            ("f_cutoff high (Hz)", "f_high",        "100000"),
-            ("search_window (s)",  "search_window", "5e-5"),
-            ("fit_window (s)",     "fit_window",    "0.1"),
-            ("d_sphere_nm (nm)",   "d_sphere_nm",   "166.0"),
-            ("keV_per_N",          "keV_per_N",     "1.0"),
-            ("ds_factor (int)",    "ds_factor",     "1"),
+            ("f_cutoff low (Hz)",   "f_low",           "20000"),
+            ("f_cutoff high (Hz)",  "f_high",          "100000"),
+            ("search_window (s)",   "search_window",   "5e-5"),
+            ("fit_window (s)",      "fit_window",      "0.1"),
+            ("d_sphere_nm (nm)",    "d_sphere_nm",     "166.0"),
+            ("meters_per_volt (m/V)", "meters_per_volt", "5e-8"),
+            ("keV_per_N",           "keV_per_N",       "1.0"),
+            ("ds_factor (int)",     "ds_factor",       "1"),
         ]
         for r, (label, key, default) in enumerate(fields):
             cg.addWidget(QLabel(label), r, 0)
@@ -169,11 +171,29 @@ class NanosphereGUI(QMainWindow):
             cg.addWidget(edit, r, 1)
             self._cfg[key] = edit
 
+        # Update meters_per_volt default when sphere diameter is changed
+        self._cfg['d_sphere_nm'].editingFinished.connect(self._auto_update_mpv)
+
         r = len(fields)
         self.calibrate_cb = QCheckBox("calibrate")
         self.notch_cb = QCheckBox("apply_notch")
         cg.addWidget(self.calibrate_cb, r, 0)
         cg.addWidget(self.notch_cb,     r, 1)
+        r += 1
+
+        # Config-file override row
+        cg.addWidget(QLabel("Config file:"), r, 0)
+        self.cfg_file_edit = QLineEdit()
+        self.cfg_file_edit.setPlaceholderText("optional .yaml…")
+        cg.addWidget(self.cfg_file_edit, r, 1)
+        r += 1
+        cfg_browse_btn = QPushButton("Browse config…")
+        cfg_browse_btn.clicked.connect(self._browse_config_file)
+        cfg_load_btn   = QPushButton("Load config")
+        cfg_load_btn.clicked.connect(self._load_config_file)
+        cg.addWidget(cfg_browse_btn, r, 0)
+        cg.addWidget(cfg_load_btn,   r, 1)
+
         layout.addWidget(cfg_group)
 
         # ---- Start/Stop button ----
@@ -301,6 +321,66 @@ class NanosphereGUI(QMainWindow):
         if path:
             self.folder_edit.setText(path)
 
+    def _auto_update_mpv(self):
+        """Log-linearly interpolate a meters_per_volt default from d_sphere_nm.
+
+        Anchor points: 100 nm → 2e-7 m/V, 166 nm → 5e-8 m/V.
+        """
+        try:
+            d = float(self._cfg['d_sphere_nm'].text())
+            log_mpv = np.interp(d, [100.0, 166.0],
+                                [np.log(2e-7), np.log(5e-8)])
+            self._cfg['meters_per_volt'].setText(f'{np.exp(log_mpv):.3e}')
+        except (ValueError, TypeError):
+            pass
+
+    def _browse_config_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select config file", "", "YAML files (*.yaml *.yml);;All files (*)")
+        if path:
+            self.cfg_file_edit.setText(path)
+
+    def _load_config_file(self):
+        """Load a NanoFile-compatible YAML config and populate the GUI fields."""
+        path = self.cfg_file_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            self.status_lbl.setText("Config file not found.")
+            return
+        try:
+            with open(path) as f:
+                cfg = yaml.safe_load(f)
+        except Exception as e:
+            self.status_lbl.setText(f"Config load error: {e}")
+            return
+
+        # Map YAML keys → GUI fields
+        simple = {
+            'search_window': 'search_window',
+            'fit_window':    'fit_window',
+            'd_sphere_nm':   'd_sphere_nm',
+            'keV_per_N':     'keV_per_N',
+            'ds_factor':     'ds_factor',
+            'meters_per_volt': 'meters_per_volt',
+        }
+        for yaml_key, cfg_key in simple.items():
+            if yaml_key in cfg:
+                self._cfg[cfg_key].setText(str(cfg[yaml_key]))
+
+        if 'f_cutoff' in cfg:
+            self._cfg['f_low'].setText(str(cfg['f_cutoff'][0]))
+            self._cfg['f_high'].setText(str(cfg['f_cutoff'][1]))
+
+        if 'calibrate' in cfg:
+            self.calibrate_cb.setChecked(bool(cfg['calibrate']))
+        if 'apply_notch' in cfg:
+            self.notch_cb.setChecked(bool(cfg['apply_notch']))
+
+        # If d_sphere_nm was loaded but meters_per_volt was not, auto-update
+        if 'd_sphere_nm' in cfg and 'meters_per_volt' not in cfg:
+            self._auto_update_mpv()
+
+        self.status_lbl.setText(f"Config loaded: {os.path.basename(path)}")
+
     def _get_nanofile_kwargs(self) -> dict:
         return dict(
             f_cutoff=[float(self._cfg['f_low'].text()),
@@ -366,6 +446,13 @@ class NanosphereGUI(QMainWindow):
 
         try:
             nf = NanoFile(file_path, **self._get_nanofile_kwargs())
+
+            # Apply manual meters_per_volt (overwritten by compute_and_fit_psd
+            # only when calibrate=True, which is the desired behaviour).
+            try:
+                nf.meters_per_volt = float(self._cfg['meters_per_volt'].text())
+            except (ValueError, KeyError):
+                pass
 
             # Parse filename for n_charges / drive params (may fail — that's ok)
             try:
