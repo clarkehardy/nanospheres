@@ -283,6 +283,7 @@ class NanoFile:
         window_s1 = np.sum(sig.get_window(self.window_func, nperseg))
         window_s2 = np.sum(sig.get_window(self.window_func, nperseg)**2)
         spectrum_to_density = window_s1/np.sqrt(window_s2*self.f_samp)
+        self.spectrum_to_density = spectrum_to_density
 
         self.freqs, Pxx_z_raw = sig.welch(self.z_raw, fs=self.f_samp, window=self.window_func, nperseg=nperseg, \
                                           noverlap=0, scaling='spectrum')
@@ -297,8 +298,11 @@ class NanoFile:
         impr_win = 1.5*self.freqs[np.argmax(Pxx_z_filt)] + np.array((0, 1e4))
         impr_inds = [np.argmin(np.abs(n - self.freqs)) for n in impr_win]
         noise_floor = np.mean(Pxx_z_raw[impr_inds[0]:impr_inds[1]])
+        self.noise_floor = noise_floor
 
         p = self.fit_voigt_profile(Pxx_z_raw, noise_floor)
+        self.p_amp = p[0]
+        self.sigma  = p[2]
 
         # Compute fitted spectrum
         fitted_spectrum = p[0]**2*voigt_profile(2*np.pi*self.freqs - p[1], p[2], p[3]) + noise_floor
@@ -312,6 +316,10 @@ class NanoFile:
             # Set passthrough filters when notch filtering is disabled
             self.notch_freqs = np.array([]).reshape(0, 2)
             self.notch_filters = np.array([[1., 0., 0., 1., 0., 0.]])
+
+        # Store final PSDs (Pxx_z_filt may have been updated by notch filters)
+        self.Pxx_z_raw  = Pxx_z_raw
+        self.Pxx_z_filt = Pxx_z_filt
 
         # compute the susceptibility in meters/Newton
         self.susceptibility = lambda omega: susc(omega, 1/self.mass_sphere, p[1], 2*p[3])
@@ -339,80 +347,36 @@ class NanoFile:
         self.omega_0 = p[1]
         self.amplitude = p[0]*self.meters_per_volt*spectrum_to_density*np.sqrt(2*self.omega_0**2*self.gamma/np.pi)
 
-        if pdf:
-            Fxx = Pxx_z_filt*(spectrum_to_density*self.meters_per_volt/np.abs(self.susceptibility(2*np.pi*self.freqs)))**2
-            p_sens = self.compute_sensitivity(Fxx, self.freqs)
-            scaled_susc = np.abs(susc(2*np.pi*self.freqs, 1/self.mass_sphere, self.omega_0, self.gamma)) \
-                          *p[0]*self.mass_sphere*np.sqrt(2*self.omega_0**2*self.gamma/np.pi)*spectrum_to_density
-            above_noise = scaled_susc > np.sqrt(noise_floor/2)*spectrum_to_density # division by 2 to get -3dB point
-            effective_bw = 1e-3*self.freqs[above_noise][-1] - 1e-3*self.freqs[above_noise][0]
-            n_avg, T_eff = self.compute_phonon_occupancy(Pxx_z_filt*(spectrum_to_density*self.meters_per_volt)**2, self.freqs, \
-                                                         [self.freqs[above_noise][0], self.freqs[above_noise][-1]])
+        # Derived quantities used by both the PDF report and the GUI
+        Fxx = Pxx_z_filt*(spectrum_to_density*self.meters_per_volt \
+              /np.abs(self.susceptibility(2*np.pi*self.freqs)))**2
+        self.p_sens = self.compute_sensitivity(Fxx, self.freqs)
+        scaled_susc = np.abs(susc(2*np.pi*self.freqs, 1/self.mass_sphere, self.omega_0, self.gamma)) \
+                      *p[0]*self.mass_sphere*np.sqrt(2*self.omega_0**2*self.gamma/np.pi)*spectrum_to_density
+        above_noise = scaled_susc > np.sqrt(noise_floor/2)*spectrum_to_density
+        if np.any(above_noise):
+            self.effective_bw = 1e-3*self.freqs[above_noise][-1] - 1e-3*self.freqs[above_noise][0]
+            self.n_avg, self.T_eff = self.compute_phonon_occupancy(
+                Pxx_z_filt*(spectrum_to_density*self.meters_per_volt)**2, self.freqs,
+                [self.freqs[above_noise][0], self.freqs[above_noise][-1]])
+        else:
+            self.effective_bw = 0.0
+            self.n_avg, self.T_eff = float('nan'), float('nan')
 
+        if pdf:
+            from plotting import plot_raw_asd, plot_force_asd, plot_position_asd
             if self.pulse_amp_keV:
                 title = '{:.0f} keV/c impulse, file {}'.format(self.pulse_amp_keV, file_num + 1)
             else:
                 title = 'File {}'.format(file_num + 1)
-            fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_raw)*spectrum_to_density, alpha=1.0, label='$z$ raw')
-            ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_filt)*spectrum_to_density, alpha=1.0, label='$z$ filtered')
-            ax.semilogy(self.freqs*1e-3, np.sqrt((p[0]**2*voigt_profile(2*np.pi*self.freqs - p[1], p[2], p[3]) \
-                        + noise_floor))*spectrum_to_density, alpha=1.0, lw=1.0, label='Voigt fit', zorder=100)
-            ax.semilogy(self.freqs*1e-3, scaled_susc, alpha=1.0, lw=1.0, label=r'Scaled $\chi$')
-            ax.axhline(np.sqrt(noise_floor)*spectrum_to_density, lw=1.0, color='C4', label='Noise floor')
-            ax.text(p[1]*1e-3/2/np.pi, 0.9*np.sqrt(noise_floor)*spectrum_to_density, \
-                    '{:.1f} kHz\n effective bandwidth'.format(effective_bw), ha='center', va='top')
-            ax.set_title(title)
-            ax.set_xlabel('Frequency [kHz]')
-            ax.set_ylabel(r'Raw ASD [V/$\sqrt{\mathrm{Hz}}$]')
-            ax.set_ylim([1e-7, 1e-1])
-            ax.set_xlim([20, 100])
-            ax.legend(loc='upper right')
-            params = np.array([p[0], self.omega_0, p[2], self.gamma])
-            exp = np.floor(np.log10(params)).astype(int)
-            mant = params / np.power(10., exp)
-            ax.text(0.03, 0.97, '$A={:.3f}\\times10^{{{:.0f}}}$, \n'.format(mant[0], exp[0]) + \
-                                '$\\omega_0={:.3f}\\times10^{{{:.0f}}}'.format(mant[1], exp[1])  + '~\\mathrm{s^{-1}}$\n' + \
-                                '$\\sigma={:.3f}\\times10^{{{:.0f}}}'.format(mant[2], exp[2])  + '~\\mathrm{s^{-1}}$\n' + \
-                                '$\\gamma={:.3f}\\times10^{{{:.0f}}}'.format(mant[3], exp[3]) + '~\\mathrm{s^{-1}}$', \
-                                ha='left', va='top', transform=ax.transAxes)
-            ax.grid(which='both')
-            pdf.savefig(fig, dpi=150)
-            fig.clf()
-            plt.close()
-            del fig, ax
-            gc.collect()
-
-            fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_filt)*spectrum_to_density*self.meters_per_volt/\
-                                         np.abs(self.susceptibility(2*np.pi*self.freqs)), alpha=1.0, label='$z$ raw')
-            ax.set_title(title)
-            ax.set_xlabel('Frequency [kHz]')
-            ax.set_ylabel(r'Calibrated ASD [$\mathrm{N/\sqrt{Hz}}$]')
-            ax.set_xlim([20, 100])
-            ax.set_ylim([1e-21, 1e-18])
-            ax.text(0.03, 0.97, '$\\Delta p={:.1f}$ keV/c'.format(p_sens), ha='left', va='top', transform=ax.transAxes)
-            ax.grid(which='both')
-            pdf.savefig(fig, dpi=150)
-            fig.clf()
-            plt.close()
-            del fig, ax
-            gc.collect()
-
-            fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-            ax.semilogy(self.freqs*1e-3, np.sqrt(Pxx_z_filt)*spectrum_to_density*self.meters_per_volt)
-            ax.set_title(title)
-            ax.set_xlabel('Frequency [kHz]')
-            ax.set_ylabel(r'Calibrated ASD [$\mathrm{m/\sqrt{Hz}}$]')
-            ax.set_xlim([20, 100])
-            ax.set_ylim([1e-14, 1e-9])
-            ax.text(0.03, 0.97, '$n={:.0f}$ phonons,\n$T={:.0f}$ mK'.format(n_avg, T_eff*1e3), ha='left', va='top', transform=ax.transAxes)
-            ax.grid(which='both')
-            pdf.savefig(fig, dpi=150)
-            fig.clf()
-            plt.close()
-            del fig, ax
-            gc.collect()
+            for plot_fn in [plot_raw_asd, plot_force_asd, plot_position_asd]:
+                fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
+                plot_fn(self, ax, title=title)
+                pdf.savefig(fig, dpi=150)
+                fig.clf()
+                plt.close()
+                del fig, ax
+                gc.collect()
 
     def fit_voigt_profile(self, Pxx_z_filt, C):
         """Fits a Voigt profile to the spectrum for a full file.
@@ -967,6 +931,7 @@ class NanoFile:
         p1, c, _, _, ier = leastsq(fun, x0=p0, full_output=True)
 
         C = np.mean(Pxx_filt[(freq_filt > 7e4) & (freq_filt < 9e4)])/self.amplitude**2/self.mass_sphere**2
+        # print(C*self.mass_sphere**2)
 
         p = np.concat((p1, [self.gamma]))
 
@@ -1073,7 +1038,8 @@ class NanoFile:
             chi = susc(2.*np.pi*freq_fft, 1./self.mass_sphere, params[1], self.gamma)
 
         if C is None:
-            C = 5e-23/self.mass_sphere**2
+            # C = 5e-23/self.mass_sphere**2
+            C = 5e-22/self.mass_sphere**2
 
         # model the noise PSD as proportional to the susceptibility plus constant imprecision noise
         J_psd = np.abs(chi)**2 + C
@@ -1312,6 +1278,8 @@ class NanoDataset:
         :type config: dict or str or Path, optional
         """
         self.path = path
+        if path is None:
+            path = ''
         self.file_paths = [f for f in glob(path + '_*.hdf5') if not f.endswith('_processed.hdf5')]
         self.file_inds = [int(f.split('_')[-1].split('.hdf5')[0]) for f in self.file_paths]
         sort_inds = np.argsort(self.file_inds)
@@ -1559,6 +1527,9 @@ class NanoDataset:
             if hasattr(self, 'resonance_params'):
                 f.create_dataset('resonance_params', data=self.resonance_params, compression='gzip')
             
+            if hasattr(self, 'cal_facs'):
+                f.create_dataset('cal_facs', data=self.cal_facs, compression='gzip')
+            
             if hasattr(self, 'recon_impulse_inds'):
                 f.create_dataset('recon_impulse_inds', data=self.recon_impulse_inds, compression='gzip')
             
@@ -1664,6 +1635,9 @@ class NanoDataset:
             
             if 'resonance_params' in f:
                 self.resonance_params = f['resonance_params'][:]
+            
+            if 'cal_facs' in f:
+                self.cal_facs = f['cal_facs'][:]
             
             if 'recon_impulse_inds' in f:
                 self.recon_impulse_inds = f['recon_impulse_inds'][:]
