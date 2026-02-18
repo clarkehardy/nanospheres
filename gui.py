@@ -17,6 +17,7 @@ import glob
 import time
 import traceback
 import yaml
+from datetime import datetime
 
 import matplotlib
 matplotlib.use('QtAgg')
@@ -91,6 +92,9 @@ class NanosphereGUI(QMainWindow):
         self.resize(1100, 760)
 
         self._watcher: FileWatcher | None = None
+        # Accumulated time-trace segments: list of (t_offset_s, times, z_raw)
+        self._trace_segments: list = []
+        self._trace_t0: float | None = None   # absolute epoch s of first segment
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -196,7 +200,7 @@ class NanosphereGUI(QMainWindow):
 
         layout.addWidget(cfg_group)
 
-        # ---- Start/Stop button ----
+        # ---- Start/Stop button + Clear trace ----
         self.watch_btn = QPushButton("Start Watching")
         self.watch_btn.setCheckable(True)
         self.watch_btn.setStyleSheet(
@@ -205,6 +209,10 @@ class NanosphereGUI(QMainWindow):
         )
         self.watch_btn.clicked.connect(self._toggle_watch)
         layout.addWidget(self.watch_btn)
+
+        clear_btn = QPushButton("Clear trace")
+        clear_btn.clicked.connect(self._clear_trace)
+        layout.addWidget(clear_btn)
 
         # ---- Readouts ----
         ro_group = QGroupBox("Calibration Readouts")
@@ -320,6 +328,32 @@ class NanosphereGUI(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select data folder")
         if path:
             self.folder_edit.setText(path)
+
+    @staticmethod
+    def _parse_timestamp(ts) -> float | None:
+        """Return a Unix-epoch float from whatever the HDF5 timestamp attribute is."""
+        if isinstance(ts, (int, float)):
+            return float(ts)
+        if isinstance(ts, bytes):
+            ts = ts.decode()
+        if isinstance(ts, str):
+            for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
+                        '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
+                try:
+                    return datetime.strptime(ts, fmt).timestamp()
+                except ValueError:
+                    continue
+        return None
+
+    def _clear_trace(self):
+        self._trace_segments.clear()
+        self._trace_t0 = None
+        self.ax_trace.cla()
+        self.ax_trace.set_xlabel("Time (s)")
+        self.ax_trace.set_ylabel("Signal (V)")
+        self.ax_trace.grid(True, alpha=0.4)
+        self.fig_trace.tight_layout()
+        self.canvas_trace.draw()
 
     def _auto_update_mpv(self):
         """Log-linearly interpolate a meters_per_volt default from d_sphere_nm.
@@ -490,7 +524,7 @@ class NanosphereGUI(QMainWindow):
 
             n_charges = getattr(nf, 'n_charges', None)
             self._readouts['n_charges'].setText(
-                _fmt(n_charges, '.1f') if n_charges is not None else 'N/A')
+                _fmt(n_charges, '.0f') if n_charges is not None else 'N/A')
 
             self._readouts['phonon_n'].setText(_fmt(nf.n_avg, '.3g'))
             self._readouts['T_eff'].setText(_fmt(nf.T_eff, '.4g'))
@@ -524,14 +558,32 @@ class NanosphereGUI(QMainWindow):
                 pass
 
             # -----------------------------------------------------------
-            # Time trace (downsampled to ≤10 k points)
+            # Accumulated time trace
             # -----------------------------------------------------------
-            z = nf.z_raw
-            t = nf.times
-            stride = max(1, len(z) // 10000)
+            t_abs = self._parse_timestamp(nf.timestamp)
+
+            if self._trace_t0 is None:
+                # First segment: set the reference epoch
+                self._trace_t0 = t_abs if t_abs is not None else 0.0
+                t_offset = 0.0
+            elif t_abs is not None:
+                # Subsequent segments: offset relative to the first file
+                t_offset = t_abs - self._trace_t0
+            else:
+                # Timestamp unreadable: place immediately after the last segment
+                last_off, last_t, _ = self._trace_segments[-1]
+                t_offset = last_off + last_t[-1]
+
+            self._trace_segments.append((t_offset, nf.times, nf.z_raw))
+
+            # Downsample globally so the total plotted points stay ≤ 10 k
+            total_samples = sum(len(seg[2]) for seg in self._trace_segments)
+            stride = max(1, total_samples // 10000)
+
             self.ax_trace.cla()
-            self.ax_trace.plot(t[::stride], z[::stride],
-                               lw=0.5, alpha=0.85, color='C0')
+            for t_off, times, z in self._trace_segments:
+                self.ax_trace.plot(t_off + times[::stride], z[::stride],
+                                   lw=0.5, alpha=0.85, color='C0')
             self.ax_trace.set_xlabel("Time (s)")
             self.ax_trace.set_ylabel("Signal (V)")
             self.ax_trace.grid(True, alpha=0.4)
