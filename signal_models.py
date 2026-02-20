@@ -21,6 +21,8 @@ SPHERE_SURFACE_AREA = 4 * np.pi * SPHERE_RADIUS**2  # m^2
 
 # Gas properties
 XE_MASS_AMU = 131.3  # Xenon atomic mass in amu
+KR_MASS_AMU = 83.8 # Krypton atomic mass in amu
+SF6_MASS_AMU = 146.05 # SF6 mass in g/mol
 
 
 def _gauss(x, A, mu, sigma):
@@ -143,7 +145,8 @@ def _smear_drdqz_gauss(qq, drdqz, sigma_kev):
 
 
 def gas_collision_spectrum(impulses_kev, pressure_mbar, resolution_kev,
-                           temperature_K=293, diameter_nm=166.):
+                           temperature_K=293, diameter_nm=166., alpha=1.,
+                           gas='xenon'):
     """
     Compute the expected gas collision spectrum for a trapped nanosphere.
 
@@ -184,8 +187,14 @@ def gas_collision_spectrum(impulses_kev, pressure_mbar, resolution_kev,
     surface_area = 4 * np.pi * radius_m**2
 
     # Compute differential rate for Xenon gas with diffuse reflection (alpha=1)
-    dr_dq = _dgamma_dp(impulses_kev, surface_area, XE_MASS_AMU,
-                       pressure_mbar, alpha=1, T=temperature_K)
+    if gas == 'xenon':
+        mass = XE_MASS_AMU
+    elif gas == 'krypton':
+        mass = KR_MASS_AMU
+    elif gas == 'sf6':
+        mass = SF6_MASS_AMU
+    dr_dq = _dgamma_dp(impulses_kev, surface_area, mass,
+                       pressure_mbar, alpha=alpha, T=temperature_K)
 
     # Project onto measurement axis (z)
     _, drdqz = _get_drdqz(impulses_kev, dr_dq)

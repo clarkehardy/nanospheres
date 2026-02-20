@@ -171,10 +171,15 @@ def process_dataset(dataset_ind):
     rms_mask = impulse_rms < rms_cut
     mask = rms_mask & fit_success
 
+    # Compute pulse timestamps (absolute time from start)
+    n_repeats = (pulse_times.shape[1] + timestamps.shape[1] - 1) // timestamps.shape[1]
+    pulse_timestamps = pulse_times + np.repeat(timestamps, n_repeats, axis=1)[:, :pulse_times.shape[1]]
+    pulse_timestamps -= np.amin(pulse_timestamps)
+
     # Plot RMS over time
     fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
     for i in range(impulse_rms.shape[0]):
-        ax.plot(pulse_times[i], np.abs(impulse_rms[i]), label='{:.0f} keV'.format(pulse_amps_keV[i]))
+        ax.plot(pulse_timestamps[i], np.abs(impulse_rms[i]), label='{:.0f} keV'.format(pulse_amps_keV[i]))
     ax.set_xlabel('Time [s]')
     ax.set_ylabel('Force RMS [N]')
     ax.set_yscale('log')
@@ -186,10 +191,8 @@ def process_dataset(dataset_ind):
     plt.close(fig)
 
     # Resonance parameter drift plots
-    n_repeats = (pulse_times.shape[1] + timestamps.shape[1] - 1) // timestamps.shape[1]
-    pulse_timestamps = pulse_times + np.tile(timestamps, (1, n_repeats))[:, :pulse_times.shape[1]]
-    res_evol = np.array([resonance_params[...,i].flatten()[np.argsort(pulse_timestamps.flatten())] for i in range(3)])
-    res_times = np.sort(pulse_timestamps.flatten()) - np.amin(pulse_timestamps)
+    res_evol = np.array([resonance_params[...,i].flatten() for i in range(3)])
+    res_times = pulse_timestamps.flatten()
 
     fig, ax = plt.subplots(3, 2, figsize=(6, 8), sharex='col', sharey='row', width_ratios=[4, 1], layout='constrained')
     ax[0,0].semilogy(res_times, res_evol[0], marker='.', ms=2, ls='none')
@@ -261,7 +264,7 @@ def process_dataset(dataset_ind):
         imp = imp_all[mask[i]]
         mean = np.mean(np.abs(imp))
         std = np.std(np.abs(imp))
-        counts, bins = np.histogram(np.abs(imp), bins=np.linspace(np.amax((0, mean - 4*std)), mean + 4*std, 20))
+        counts, bins = np.histogram(np.abs(imp), bins=np.linspace(np.amax((0, mean - 5*std)), mean + 5*std, 20))
         bins = (bins[:-1] + bins[1:])/2.
         p, _ = curve_fit(gaus, bins, counts, p0=(10, np.mean(np.abs(imp)), np.std(np.abs(imp))))
         plot_bins = np.linspace(bins[0], bins[-1], 200)

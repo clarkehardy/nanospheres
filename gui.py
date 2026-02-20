@@ -210,7 +210,7 @@ class NanosphereGUI(QMainWindow):
         self.watch_btn.clicked.connect(self._toggle_watch)
         layout.addWidget(self.watch_btn)
 
-        clear_btn = QPushButton("Clear trace")
+        clear_btn = QPushButton("Clear history")
         clear_btn.clicked.connect(self._clear_trace)
         layout.addWidget(clear_btn)
 
