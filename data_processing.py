@@ -91,6 +91,7 @@ class NanoFile:
         self.drive_freq = None
         self.drive_amp = None
         self.meters_per_volt = None
+        self.fixed_imprecision = True
         if config:
             self.load_config(config)
         V_ns = (4/3.)*np.pi*(self.d_sphere_nm*1e-9/2.)**3
@@ -306,8 +307,6 @@ class NanoFile:
         self.noise_floor = noise_floor
 
         p = self.fit_voigt_profile(Pxx_z_raw, noise_floor)
-        self.p_amp = p[0]
-        self.sigma  = p[2]
 
         # Compute fitted spectrum
         fitted_spectrum = p[0]**2*voigt_profile(2*np.pi*self.freqs - p[1], p[2], p[3]) + noise_floor
@@ -350,8 +349,10 @@ class NanoFile:
         self.z_calibrated = self.z_filtered * self.meters_per_volt
 
         # save resonance parameters as class attributes
+        self.p_amp = p[0] # Voigt area scaling factor
         self.gamma = 2*p[3] # Voigt gamma is HWHM; oscillator model uses FWHM
-        self.omega_0 = p[1]
+        self.omega_0 = p[1] # resonant frequency
+        self.sigma  = p[2] # Gaussian smearing
         self.amplitude = p[0]*self.meters_per_volt*spectrum_to_density*np.sqrt(2*self.omega_0**2*self.gamma/np.pi)
 
         # Derived quantities used by both the PDF report and the GUI
@@ -362,7 +363,7 @@ class NanoFile:
                       *p[0]*self.mass_sphere*np.sqrt(2*self.omega_0**2*self.gamma/np.pi)*spectrum_to_density
         above_noise = scaled_susc > np.sqrt(noise_floor/2)*spectrum_to_density
         if np.any(above_noise):
-            self.effective_bw = 1e-3*self.freqs[above_noise][-1] - 1e-3*self.freqs[above_noise][0]
+            self.effective_bw = self.freqs[above_noise][-1] - self.freqs[above_noise][0]
             self.n_avg, self.T_eff = self.compute_phonon_occupancy(
                 Pxx_z_filt*(spectrum_to_density*self.meters_per_volt)**2, self.freqs,
                 [self.freqs[above_noise][0], self.freqs[above_noise][-1]])
@@ -370,13 +371,23 @@ class NanoFile:
             self.effective_bw = 0.0
             self.n_avg, self.T_eff = float('nan'), float('nan')
 
+        # compute the constant imprecision noise term used in the noise model
+        if not self.fixed_imprecision:
+            snr = p[0] / (self.noise_floor * self.effective_bw)
+            bw = self.effective_bw
+        else:
+            snr = 1e6 # default to 60 dB SNR
+            bw = 20e3 # bandwidth over which SNR is determined in Hz
+        gamma = 4 # rad/s, always use fixed gamma for determination of C_psd since fitting errors can add variance
+        self.C_psd = np.pi / (2 * snr * self.mass_sphere**2 * self.omega_0**2 * gamma * bw)
+
         if pdf:
-            from plotting import plot_raw_asd, plot_force_asd, plot_position_asd
+            from plotting import plot_raw_psd, plot_force_asd, plot_position_asd
             if self.pulse_amp_keV:
                 title = '{:.0f} keV/c impulse, file {}'.format(self.pulse_amp_keV, file_num + 1)
             else:
                 title = 'File {}'.format(file_num + 1)
-            for plot_fn in [plot_raw_asd, plot_force_asd, plot_position_asd]:
+            for plot_fn in [plot_raw_psd, plot_force_asd, plot_position_asd]:
                 fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
                 plot_fn(self, ax, title=title)
                 pdf.savefig(fig, dpi=150)
@@ -399,7 +410,7 @@ class NanoFile:
         omega_0_guess = 2*np.pi*self.freqs[f_0_inds[0] + np.argmax(Pxx_z_filt[f_0_inds[0]:f_0_inds[1]])]
         gamma_guess = 2*np.pi*1e-2
         sigma_guess = 2*np.pi*1e2
-        A_guess = 5e-3
+        A_guess = 0.1
         p0 = [A_guess, omega_0_guess, sigma_guess, gamma_guess]
 
         fit_bw = 2*np.pi*2e4
@@ -688,8 +699,8 @@ class NanoFile:
                 print('Computing optimal filter for window {} of {}...'.format(i + 1, num_optimal_filters))
 
             z_fit_win = self.z_calibrated[i*fit_window_samples:(i + 1)*fit_window_samples]
-            params, success, C = self.fit_susceptibility(z_fit_win, file_num=file_num, impulse_num=i, \
-                                                         res_fit_pdf=res_fit_pdf, noise_spectra_pdf=noise_spectra_pdf)
+            params, success = self.fit_susceptibility(z_fit_win, file_num=file_num, impulse_num=i, \
+                                                      res_fit_pdf=res_fit_pdf, noise_spectra_pdf=noise_spectra_pdf)
 
             if success:
                 current_params = params
@@ -877,7 +888,7 @@ class NanoFile:
             if self.verbose:
                 print('    -> Computing impulse for kick at t={:.5f} seconds...'.format(self.times[ind]))
             times_win, z_win = self.get_time_window(ind, t_window=self.fit_window, centered=False)
-            p, success, C = self.fit_susceptibility(z_win, file_num, i, res_fit_pdf, noise_spectra_pdf)
+            p, success = self.fit_susceptibility(z_win, file_num, i, res_fit_pdf, noise_spectra_pdf)
             if not success:
                 print(f'Fit for impulse {i + 1} failed!')
             resonance_params.append(p)
@@ -933,33 +944,13 @@ class NanoFile:
         fun = lambda x: abs_susc2(2*np.pi*freq_fit, *x, gamma=self.gamma) - Pxx_fit
 
         p0 = [1., 2*np.pi*freq_filt[peak_ind]]
-        p1, c, _, _, ier = leastsq(fun, x0=p0, full_output=True)
-
-        C = np.mean(Pxx_filt[(freq_filt > 7e4) & (freq_filt < 9e4)])/self.amplitude**2/self.mass_sphere**2
-        # print(C*self.mass_sphere**2)
-
+        p1, _, _, _, ier = leastsq(fun, x0=p0, full_output=True)
         p = np.concat((p1, [self.gamma]))
 
         if ier in [1, 2, 3, 4]:
             success = True
         else:
             success = False
-
-        # # determine the calibration factor
-        # window_s1 = np.sum(sig.get_window(self.window_func, nperseg))
-        # window_s2 = np.sum(sig.get_window(self.window_func, nperseg)**2)
-        # spectrum_to_density = window_s1/np.sqrt(window_s2*self.f_samp)
-        # resp = np.sqrt(2*Pxx_filt[np.argmin(np.abs(freq_filt - self.drive_freq))])/spectrum_to_density/self.bandpass_gain
-        # cal_fac = np.mean(self.n_charges*e*self.Efield*np.abs(self.drive_amp/resp))*np.abs(self.susceptibility(2*np.pi*self.drive_freq))
-        # else:
-        #     drive = 1.
-        #     n_charges = 1.
-        #     ind_100k = np.argmin(np.abs(freq_filt - 1e5))
-        #     drive_ind = ind_100k + np.argmax(Pxx_filt[freq_filt >= 1e5])
-        #     drive_freq = freq_filt[drive_ind]
-        #     print(drive_freq)
-        #     resp = np.sqrt(2*Pxx_filt[drive_ind])/spectrum_to_density/self.bandpass_gain
-        #     cal_fac = np.mean(n_charges*e*self.Efield*np.abs(drive/resp))*np.abs(self.susceptibility(2*np.pi*drive_freq))
 
         if res_fit_pdf:
             plot_freq = np.linspace(freq_filt[peak_ind - 2*(ind2 - ind1)], freq_filt[peak_ind + 2*(ind2 - ind1)], 1000)
@@ -989,7 +980,7 @@ class NanoFile:
 
         if noise_spectra_pdf:
             Fxx = np.abs(np.sqrt(Pxx_filt)/susc(2*np.pi*freq_filt, 1/self.mass_sphere, *p[1:]))**2
-            above_noise = Pxx_filt > C*self.amplitude**2*self.mass_sphere**2/2. # division by 2 to get -3dB point
+            above_noise = np.abs(2 * np.pi * freq_filt - self.omega_0) > self.effective_bw/2
             n_avg, T_eff = self.compute_phonon_occupancy(Pxx_filt, freq_filt, \
                                                          [freq_filt[above_noise][0], freq_filt[above_noise][-1]])
             fig, ax = plt.subplots(1, 2, figsize=(8, 4), sharex=True, layout='constrained')
@@ -1017,9 +1008,9 @@ class NanoFile:
             del fig, ax
             gc.collect()
 
-        return p, success, C
+        return p, success
 
-    def build_optimal_filter(self, window_len, params=None, C=None, file_num=None, impulse_num=None, pdf=None):
+    def build_optimal_filter(self, window_len, params=None, file_num=None, impulse_num=None, pdf=None):
         """Build the optimal filter to deconvolve the response of the oscillator from the position data.
 
         :param window_len: length of the time window
@@ -1042,12 +1033,8 @@ class NanoFile:
         else: 
             chi = susc(2.*np.pi*freq_fft, 1./self.mass_sphere, params[1], self.gamma)
 
-        if C is None:
-            # C = 5e-23/self.mass_sphere**2
-            C = 5e-22/self.mass_sphere**2
-
         # model the noise PSD as proportional to the susceptibility plus constant imprecision noise
-        J_psd = np.abs(chi)**2 + C
+        J_psd = np.abs(chi)**2 + self.C_psd
 
         # construct the optimal filter from the susceptibility and the noise
         optimal = np.conj(chi)/J_psd
@@ -1061,10 +1048,10 @@ class NanoFile:
             sort_inds = np.concat((np.arange(irfft_len//2, irfft_len), np.arange(0, irfft_len//2)))
             ax[0].plot(time_array*1e6, irfft_output[sort_inds]/irfft_output[0], \
                        label='$C$')
-            irfft_scaled = np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 3*C))
+            irfft_scaled = np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 3*self.C_psd))
             irfft_scaled = irfft_scaled[sort_inds]/irfft_scaled[0]
             ax[0].plot(time_array*1e6, irfft_scaled, label=r'$C\times3$')
-            irfft_scaled = np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 0.333*C))
+            irfft_scaled = np.fft.irfft(np.conj(chi)/(np.abs(chi)**2 + 0.333*self.C_psd))
             irfft_scaled = irfft_scaled[sort_inds]/irfft_scaled[0]
             ax[0].plot(time_array*1e6, irfft_scaled, label=r'$C/3$')
             ax[0].set_xlim([-25, 25])
@@ -1077,8 +1064,8 @@ class NanoFile:
             else:
                 ax[0].set_title('File {}, window {}'.format(file_num + 1, impulse_num + 1))
             ax[1].semilogy(freq_fft*1e-3, np.abs(optimal)/np.amax(np.abs(optimal)))
-            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 3*C))/np.amax(np.abs(optimal)))
-            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 0.333*C))/np.amax(np.abs(optimal)))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 3*self.C_psd))/np.amax(np.abs(optimal)))
+            ax[1].semilogy(freq_fft*1e-3, np.abs(np.conj(chi)/(np.abs(chi)**2 + 0.333*self.C_psd))/np.amax(np.abs(optimal)))
             ax[1].set_xlabel('Frequency [kHz]')
             ax[1].set_ylabel('Filter magnitude [au]')
             ax[1].set_xlim([0, 1e2])
