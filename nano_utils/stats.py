@@ -1,14 +1,36 @@
-"""
-Statistical models for gas collision spectral fitting.
+"""Statistical models for gas collision spectral fitting.
 
-Provides two iminuit-compatible NLL cost functions:
+Provides one iminuit-compatible NLL cost function:
 
-  GasCollisionNLL       — single-dataset Poisson / negative-binomial fit
-  JointGasCollisionNLL  — simultaneous fit across multiple datasets
+  GasCollisionNLL — simultaneous Poisson / negative-binomial fit across
+                    multiple datasets with a single shared ``impulse_scale``
+                    nuisance parameter.
 
-Both support constrained nuisance parameters (impulse-axis scale ``a`` and
-offset ``b``, sphere diameter ``d``) and an optional fractional systematic
-``f_sys`` that broadens the likelihood from Poisson to negative binomial.
+The model uses:
+
+* One shared ``impulse_scale`` nuisance parameter with Gaussian prior
+  N(1, σ_a²) representing a common calibration uncertainty.
+* Count-conserving derived background: ``A_bkg`` is not a free parameter;
+  it is derived per-dataset at each likelihood evaluation by enforcing that
+  signal + background counts equal the total observed counts above the fit
+  cutoff.
+* A joint fit over all datasets with shared ``sphere_temperature_K``,
+  ``alpha``, and ``impulse_scale`` and per-dataset ``pressure_mbar_i``,
+  ``sigma_i``.
+
+The background derivation enforces:
+
+    integral_{q_cut}^inf  A/sigma * exp(-p^2/2/sigma^2) dp
+        = N_above - integral_{q_cut}^inf  S dp
+
+where N_above is the total observed counts above the cutoff and S is the
+signal spectrum at the current parameters.  In the discrete implementation
+this becomes:
+
+    A = (N_above - N_signal_above) * scale_factor * sigma
+        / sum_i exp(-scaled_bins_i^2 / (2*sigma^2))
+
+with A clamped to >= 0.
 """
 
 import numpy as np
@@ -130,126 +152,71 @@ def _deviance_terms(n, mu, f_sys):
     return np.where(n > 0, 2 * (mu - n + n_safe * np.log(n_safe / mu)), 2 * mu)
 
 
-# ---------------------------------------------------------------------------
-# Single-dataset NLL
-# ---------------------------------------------------------------------------
+def _compute_derived_A_bkg(scaled_bins_above, N_above_obs, N_signal_above,
+                            sigma, scale_factor):
+    """Derive A_bkg by enforcing count conservation in the fit region.
 
-class GasCollisionNLL:
-    """Poisson / negative-binomial NLL for a single gas-collision dataset.
+    Solves the discrete form of the count-conservation constraint:
 
-    Parameters visible to iminuit (via ``__call__`` signature):
+    .. math::
 
-    * ``pressure_mbar``        — gas pressure [mbar]
-    * ``sphere_temperature_K`` — sphere surface temperature [K]
-    * ``sigma``                — impulse resolution [keV/c]
-    * ``alpha``                — accommodation coefficient [0, 1]
-    * ``A_bkg``                — background amplitude
-    * ``d``                    — sphere diameter [nm]  (Gaussian-constrained)
-    * ``a``                    — impulse-axis scale factor (Gaussian-constrained, mean 1)
-    * ``b``                    — impulse-axis offset [keV/c] (Gaussian-constrained, mean 0)
+        \\sum_i \\frac{A}{\\sigma}
+            \\exp\\!\\left(-\\frac{(s\\,q_i)^2}{2\\sigma^2}\\right)
+            \\frac{1}{\\text{scale\\_factor}}
+        = N_{\\text{above}} - N_{\\text{signal,above}}
 
-    :param bins: Bin centres of the fitted region [keV/c].
-    :type bins: array_like
-    :param counts: Observed counts in each bin.
-    :type counts: array_like
+    for *A*, where *s* is ``impulse_scale`` and the sum runs over all
+    above-cut bins.
+
+    :param scaled_bins_above: Impulse-scaled bin centres in the fit region
+        (``impulse_scale * q_i``) [keV/c].
+    :type scaled_bins_above: numpy.ndarray
+    :param N_above_obs: Total observed counts above the fit cutoff.
+    :type N_above_obs: float
+    :param N_signal_above: Expected signal counts above the fit cutoff from
+        the current model parameters.
+    :type N_signal_above: float
+    :param sigma: Impulse resolution [keV/c].
+    :type sigma: float
     :param scale_factor: Converts model rate to expected counts
-        (``mu = model_rate / scale_factor``).
+        (``mu = rate / scale_factor``).
     :type scale_factor: float
-    :param gas: Gas species identifier passed to :func:`signal_plus_bkg`.
-    :type gas: str
-    :param d_nominal: Nominal sphere diameter [nm] (centre of Gaussian prior on ``d``).
-    :type d_nominal: float
-    :param sigma_a: 1-sigma width of Gaussian prior on ``a``.
-    :type sigma_a: float
-    :param sigma_b: 1-sigma width of Gaussian prior on ``b`` [keV/c].
-    :type sigma_b: float
-    :param sigma_d: 1-sigma width of Gaussian prior on ``d`` [nm].
-    :type sigma_d: float
-    :param f_sys: Fractional systematic per bin (0 = pure Poisson).
-    :type f_sys: float
+    :returns: Derived A_bkg, clamped to >= 0.
+    :rtype: float
     """
-
-    def __init__(self, bins, counts, scale_factor, gas, d_nominal,
-                 sigma_a, sigma_b, sigma_d, f_sys=0.):
-        self.bins         = np.asarray(bins)
-        self.counts       = np.asarray(counts)
-        self.scale_factor = scale_factor
-        self.gas          = gas
-        self.d_nominal    = d_nominal
-        self.sigma_a      = sigma_a
-        self.sigma_b      = sigma_b
-        self.sigma_d      = sigma_d
-        self.f_sys        = f_sys
-
-    def __call__(self, pressure_mbar, sphere_temperature_K, sigma, alpha,
-                 A_bkg, d, a, b):
-        distorted_bins = a * self.bins + b
-        if np.isnan(distorted_bins).any():
-            return np.inf
-        model_rate = signal_plus_bkg(
-            distorted_bins, pressure_mbar, sphere_temperature_K,
-            sigma, alpha, A_bkg, d, self.gas,
-        )
-        mu = np.maximum(model_rate / self.scale_factor, 1e-10)
-        nll  = _nll_terms(self.counts, mu, self.f_sys)
-        nll += (a - 1.)**2 / (2. * self.sigma_a**2)
-        nll += b**2        / (2. * self.sigma_b**2)
-        nll += (d - self.d_nominal)**2 / (2. * self.sigma_d**2)
-        return nll
-
-    def goodness_of_fit(self, minuit):
-        """Likelihood-ratio goodness-of-fit statistic (deviance / G-test).
-
-        Under the null hypothesis (model correct), the statistic is
-        approximately chi-squared with ``N_bins - N_free`` degrees of freedom.
-
-        :param minuit: Fitted Minuit object.
-        :type minuit: iminuit.Minuit
-        :returns: ``(g_stat, ndof, p_value)``
-        :rtype: tuple[float, int, float]
-        """
-        vals = dict(zip(minuit.parameters, minuit.values))
-        distorted_bins = vals['a'] * self.bins + vals['b']
-        model_rate = signal_plus_bkg(
-            distorted_bins,
-            vals['pressure_mbar'], vals['sphere_temperature_K'],
-            vals['sigma'], vals['alpha'], vals['A_bkg'],
-            vals['d'], self.gas,
-        )
-        mu      = np.maximum(model_rate / self.scale_factor, 1e-10)
-        g_stat  = float(np.sum(_deviance_terms(self.counts, mu, self.f_sys)))
-        ndof    = len(self.bins) - minuit.nfit
-        p_value = float(1 - scipy_stats.chi2.cdf(g_stat, ndof))
-        return g_stat, ndof, p_value
+    N_bkg_above = max(float(N_above_obs) - float(N_signal_above), 0.)
+    gauss_sum   = float(np.sum(np.exp(-scaled_bins_above**2 / (2. * sigma**2))))
+    if gauss_sum <= 0.:
+        return 0.
+    return N_bkg_above * scale_factor * sigma / gauss_sum
 
 
 # ---------------------------------------------------------------------------
 # Joint NLL
 # ---------------------------------------------------------------------------
 
-class JointGasCollisionNLL:
+class GasCollisionNLL:
     """Joint Poisson / negative-binomial NLL across multiple datasets.
 
     Shared parameters (one per fit):
-        ``sphere_temperature_K``, ``alpha``, ``d``, ``A_bkg``
+        ``sphere_temperature_K``, ``alpha``, ``impulse_scale``
 
     Per-dataset parameters (one per dataset, indexed 0 … N-1):
-        ``pressure_mbar_{i}``, ``sigma_{i}``, ``a_{i}``, ``b_{i}``
+        ``pressure_mbar_{i}``, ``sigma_{i}``
 
-    The sphere-diameter Gaussian constraint is applied once (shared).
-    Nuisance constraints on ``a`` and ``b`` are applied independently
-    per dataset.
+    ``A_bkg`` is not a free parameter; it is derived per-dataset at each
+    evaluation by enforcing count conservation in each dataset's fit region.
+
+    The sphere diameter is held fixed at *d_nominal* and is not a free
+    parameter of the fit.
 
     Parameter layout in ``__call__(*args)``::
 
         args[0]             sphere_temperature_K
         args[1]             alpha
-        args[2]             d
-        args[3]             A_bkg
-        args[4 : 4+N]       pressure_mbar_0 … pressure_mbar_{N-1}
-        args[4+N : 4+2N]    sigma_0 … sigma_{N-1}
-        args[4+2N : 4+3N]   a_0 … a_{N-1}
-        args[4+3N : 4+4N]   b_0 … b_{N-1}
+        args[2 : 2+N]       pressure_mbar_0 … pressure_mbar_{N-1}
+        args[2+N : 2+2N]    sigma_0 … sigma_{N-1}
+        args[2+2N]          impulse_scale
 
     Use the :attr:`param_names` property to obtain the canonical parameter
     name list for Minuit instantiation.
@@ -259,27 +226,20 @@ class JointGasCollisionNLL:
     :type datasets: list[dict]
     :param gas: Gas species identifier.
     :type gas: str
-    :param d_nominal: Nominal sphere diameter [nm].
+    :param d_nominal: Sphere diameter [nm] used in the model (fixed).
     :type d_nominal: float
-    :param sigma_a: 1-sigma width of Gaussian prior on each ``a_i``.
+    :param sigma_a: 1-sigma width of Gaussian prior on ``impulse_scale``.
     :type sigma_a: float
-    :param sigma_b: 1-sigma width of Gaussian prior on each ``b_i`` [keV/c].
-    :type sigma_b: float
-    :param sigma_d: 1-sigma width of Gaussian prior on ``d`` [nm].
-    :type sigma_d: float
     :param f_sys: Fractional systematic per bin (0 = pure Poisson).
     :type f_sys: float
     """
 
-    def __init__(self, datasets, gas, d_nominal,
-                 sigma_a, sigma_b, sigma_d, f_sys=0.):
+    def __init__(self, datasets, gas, d_nominal, sigma_a, f_sys=0.):
         self.data      = datasets
         self.n         = len(datasets)
         self.gas       = gas
         self.d_nominal = d_nominal
         self.sigma_a   = sigma_a
-        self.sigma_b   = sigma_b
-        self.sigma_d   = sigma_d
         self.f_sys     = f_sys
 
     @property
@@ -289,47 +249,100 @@ class JointGasCollisionNLL:
         :rtype: list[str]
         """
         n = self.n
-        return (
-            ['sphere_temperature_K', 'alpha', 'd', 'A_bkg']
-            + [f'pressure_mbar_{i}' for i in range(n)]
-            + [f'sigma_{i}'         for i in range(n)]
-            + [f'a_{i}'             for i in range(n)]
-            + [f'b_{i}'             for i in range(n)]
+        names  = ['sphere_temperature_K', 'alpha']
+        names += [f'pressure_mbar_{i}' for i in range(n)]
+        names += [f'sigma_{i}'         for i in range(n)]
+        names += ['impulse_scale']
+        return names
+
+    def _get_A_bkg_i(self, ds, signal_rate_i, sigma_i, scaled_bins_i):
+        """Derive A_bkg for dataset *ds* at the current parameters.
+
+        :param ds: Dataset dict with ``'bins'``, ``'counts'``, ``'scale_factor'``.
+        :param signal_rate_i: Signal model rate at *scaled_bins_i*.
+        :param sigma_i: Current impulse resolution [keV/c].
+        :param scaled_bins_i: ``impulse_scale * ds['bins']`` [keV/c].
+        :returns: Derived A_bkg.
+        :rtype: float
+        """
+        N_signal_above = float(np.sum(signal_rate_i / ds['scale_factor']))
+        return _compute_derived_A_bkg(
+            scaled_bins_i, float(np.sum(ds['counts'])),
+            N_signal_above, sigma_i, ds['scale_factor'],
         )
 
+    def get_A_bkg(self, minuit, dataset_index):
+        """Return A_bkg for dataset *dataset_index* given a fitted Minuit object.
+
+        Recomputes the derived value at the best-fit parameters.
+
+        :param minuit: Fitted Minuit object.
+        :type minuit: iminuit.Minuit
+        :param dataset_index: Index into the dataset list.
+        :type dataset_index: int
+        :returns: Background amplitude A_bkg for that dataset.
+        :rtype: float
+        """
+        vals    = dict(zip(minuit.parameters, minuit.values))
+        i       = dataset_index
+        ds      = self.data[i]
+        scale_i = vals['impulse_scale']
+        sigma_i = vals[f'sigma_{i}']
+        scaled_bins_i = scale_i * ds['bins']
+        signal_rate_i = gas_collision_spectrum(
+            scaled_bins_i, vals[f'pressure_mbar_{i}'], sigma_i,
+            temperature_K=vals['sphere_temperature_K'],
+            diameter_nm=self.d_nominal, alpha=vals['alpha'], gas=self.gas,
+        )
+        return self._get_A_bkg_i(ds, signal_rate_i, sigma_i, scaled_bins_i)
+
+    def _nll_at_scale(self, ds, pressure, sigma, T_sph, alpha, A_bkg_shared, s):
+        """Per-dataset Poisson/NegBin NLL at a fixed impulse scale *s*.
+
+        Returns ``np.inf`` on NaN inputs.
+
+        :param ds: Dataset dict with ``'bins'``, ``'counts'``, ``'scale_factor'``.
+        :param pressure: Gas pressure [mbar].
+        :param sigma: Impulse resolution [keV/c].
+        :param T_sph: Sphere temperature [K].
+        :param alpha: Accommodation coefficient.
+        :param A_bkg_shared: Ignored (A_bkg is always derived).
+        :param s: Impulse scale factor.
+        :returns: Scalar NLL contribution (no prior term).
+        :rtype: float
+        """
+        scaled_bins = s * ds['bins']
+        if np.isnan(scaled_bins).any():
+            return np.inf
+        signal_rate = gas_collision_spectrum(
+            scaled_bins, pressure, sigma,
+            temperature_K=T_sph, diameter_nm=self.d_nominal,
+            alpha=alpha, gas=self.gas,
+        )
+        A_bkg      = self._get_A_bkg_i(ds, signal_rate, sigma, scaled_bins)
+        model_rate = signal_rate + half_gaus(scaled_bins, A_bkg, sigma)
+        mu = np.maximum(model_rate / ds['scale_factor'], 1e-10)
+        return _nll_terms(ds['counts'], mu, self.f_sys)
+
     def __call__(self, *args):
-        T_sph     = args[0]
-        alpha     = args[1]
-        d         = args[2]
-        A_bkg     = args[3]
+        vals      = dict(zip(self.param_names, args))
+        T_sph     = vals['sphere_temperature_K']
+        alpha     = vals['alpha']
         n         = self.n
-        pressures = args[4      : 4 +   n]
-        sigmas    = args[4 +   n : 4 + 2*n]
-        a_vals    = args[4 + 2*n : 4 + 3*n]
-        b_vals    = args[4 + 3*n : 4 + 4*n]
+        pressures = [vals[f'pressure_mbar_{i}'] for i in range(n)]
+        sigmas    = [vals[f'sigma_{i}']          for i in range(n)]
 
-        # Shared sphere-diameter constraint — applied once across all datasets
-        nll = (d - self.d_nominal)**2 / (2. * self.sigma_d**2)
-
+        s   = vals['impulse_scale']
+        nll = (s - 1.)**2 / (2. * self.sigma_a**2)
         for i, ds in enumerate(self.data):
-            a = a_vals[i]
-            b = b_vals[i]
-            distorted_bins = a * ds['bins'] + b
-            if np.isnan(distorted_bins).any():
-                return np.inf
-            model_rate = signal_plus_bkg(
-                distorted_bins, pressures[i], T_sph,
-                sigmas[i], alpha, A_bkg, d, self.gas,
-            )
-            mu  = np.maximum(model_rate / ds['scale_factor'], 1e-10)
-            nll += _nll_terms(ds['counts'], mu, self.f_sys)
-            nll += (a - 1.)**2 / (2. * self.sigma_a**2)
-            nll += b**2        / (2. * self.sigma_b**2)
-
+            nll += self._nll_at_scale(ds, pressures[i], sigmas[i], T_sph, alpha, None, s)
         return nll
 
     def goodness_of_fit(self, minuit):
         """Summed likelihood-ratio deviance across all datasets.
+
+        Under the null hypothesis (model correct), the statistic is
+        approximately chi-squared with ``N_bins - N_free`` degrees of freedom.
 
         :param minuit: Fitted Minuit object.
         :type minuit: iminuit.Minuit
@@ -339,15 +352,18 @@ class JointGasCollisionNLL:
         vals  = dict(zip(minuit.parameters, minuit.values))
         T_sph = vals['sphere_temperature_K']
         alpha = vals['alpha']
-        d     = vals['d']
-        A_bkg = vals['A_bkg']
+        s     = vals['impulse_scale']
 
         g_total = 0.
         for i, ds in enumerate(self.data):
-            distorted_bins = vals[f'a_{i}'] * ds['bins'] + vals[f'b_{i}']
-            model_rate = signal_plus_bkg(
-                distorted_bins, vals[f'pressure_mbar_{i}'],
-                T_sph, vals[f'sigma_{i}'], alpha, A_bkg, d, self.gas,
+            sigma_i = vals[f'sigma_{i}']
+            A_bkg   = self.get_A_bkg(minuit, i)
+
+            scaled_bins = s * ds['bins']
+            model_rate  = signal_plus_bkg(
+                scaled_bins, vals[f'pressure_mbar_{i}'],
+                T_sph, sigma_i, alpha, A_bkg,
+                self.d_nominal, self.gas,
             )
             mu       = np.maximum(model_rate / ds['scale_factor'], 1e-10)
             g_total += float(np.sum(_deviance_terms(ds['counts'], mu, self.f_sys)))
