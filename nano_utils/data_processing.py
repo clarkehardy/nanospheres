@@ -92,6 +92,8 @@ class NanoFile:
         self.drive_amp = None
         self.meters_per_volt = None
         self.fixed_imprecision = True
+        self.template = None
+        self.chi2 = np.array(())
         if config:
             self.load_config(config)
         V_ns = (4/3.)*np.pi*(self.d_sphere_nm*1e-9/2.)**3
@@ -373,12 +375,13 @@ class NanoFile:
 
         # compute the constant imprecision noise term used in the noise model
         if not self.fixed_imprecision:
-            snr = p[0] / (self.noise_floor * self.effective_bw)
+            snr = p[0]**2 / (self.noise_floor * self.effective_bw) * 10. # empirically, snr is underestimated from fit by ~10x
             bw = self.effective_bw
+            gamma = self.gamma
         else:
             snr = 1e6 # default to 60 dB SNR
             bw = 20e3 # bandwidth over which SNR is determined in Hz
-        gamma = 4 # rad/s, always use fixed gamma for determination of C_psd since fitting errors can add variance
+            gamma = 4 # rad/s
         self.C_psd = np.pi / (2 * snr * self.mass_sphere**2 * self.omega_0**2 * gamma * bw)
 
         if pdf:
@@ -419,7 +422,7 @@ class NanoFile:
         voigt_scaled = lambda omega, A, omega_0, sigma, gamma: A**2*voigt_profile(omega - omega_0, sigma, gamma) + C
         try:
             p, _ = curve_fit(voigt_scaled, 2*np.pi*self.freqs[fit_inds], Pxx_z_filt[fit_inds], \
-                             sigma=np.sqrt(Pxx_z_filt[fit_inds]), p0=p0)
+                             sigma=1e-2*Pxx_z_filt[fit_inds], p0=p0, bounds=([0, 0, 0, 0], [np.inf, np.inf, np.inf, 10]))
             p = np.abs(p)
         except:
             print('Voigt profile fit failed!')
@@ -779,6 +782,10 @@ class NanoFile:
         :param max_plots: maximum number of plots to generate per category (accepted/rejected), defaults to 20
         :type max_plots: int, optional
         """
+
+        if len(self.template) != int(self.search_window * self.f_samp):
+            raise ValueError('Template is the wrong length for the choice of search window!')
+
         scaled_templates = np.array(self.template)[None, :]*self.impulses[:, None]
         template_half_len = len(self.template)//2
         template_len = len(self.template)
@@ -913,7 +920,11 @@ class NanoFile:
         self.deconvolved_pulses = np.array(deconvolved_pulses)
         self.recon_impulse_inds = np.array(recon_impulse_inds)
         self.pulse_times = np.array(pulse_times)
+        if self.keV_per_N > 1e10:
+            self.convert_to_keV()
         self.compute_impulse_rms(int(self.search_window * self.f_samp))
+        if self.template:
+            self.compute_chi2()
 
     def fit_susceptibility(self, z_win, file_num=None, impulse_num=None, res_fit_pdf=None, noise_spectra_pdf=None):
         """Fits the mechanical susceptibility of the trapped nanosphere.
@@ -1131,7 +1142,7 @@ class NanoFile:
         width = int(self.search_window * self.f_samp)
         center = time_win // 2
         search_start = center - width // 2
-        search_end = center + width // 2
+        search_end = search_start + width
         
         # Extract search region for all windows
         search_region = f_filt[:, search_start:search_end]
@@ -1239,7 +1250,7 @@ class NanoFile:
         
         # Return appropriate values based on input dimensionality
         if is_1d:
-            return f_filt[0], imp_inds[0], times_win[0, 0], cal_facs[0]
+            return f_filt[0], imp_inds[0], times_win[0, imp_inds[0]], cal_facs[0]
         else:
             return f_filt, impulses, imp_inds, imp_times, cal_facs
     
@@ -1355,6 +1366,7 @@ class NanoDataset:
         timestamps = []
         pressures = []
         impulse_rms = []
+        chi2 = []
 
         plotted = 0
 
@@ -1388,6 +1400,7 @@ class NanoDataset:
             pressures.append(nf.pressure)
             pulse_times.append(nf.pulse_times)
             impulse_rms.append(nf.impulse_rms)
+            chi2.append(nf.chi2)
             res_params.append(nf.resonance_params)
             cal_facs.append(nf.cal_facs)
             fit_success.append(nf.fit_success)
@@ -1410,6 +1423,7 @@ class NanoDataset:
         self.timestamps = np.array(timestamps)
         self.pressures = np.array(pressures)
         self.impulse_rms = np.concatenate(impulse_rms)
+        self.chi2 = np.concatenate(chi2)
         self.close_pdfs()
 
     def load_search_data(self, num_to_plot=1):
@@ -1487,18 +1501,21 @@ class NanoDataset:
         self.deconvolved_pulses = np.concatenate(deconvolved_pulses)
         self.close_pdfs()
 
-    def save_to_hdf5(self, path=None):
+    def save_to_hdf5(self, path=None, save_waveforms=True):
         """Save the NanoDataset object to an HDF5 file.
-        
+
         Saves all configuration parameters as attributes and all data arrays as datasets.
         This allows for perfect reinstantiation of the object using load_from_hdf5.
-        
+
         :param path: path to the HDF5 file to save to. If None, uses self.path + '_processed.hdf5'
         :type path: str, optional
+        :param save_waveforms: if True (default), save the full waveform arrays (``pulses`` and
+            ``deconvolved_pulses``). Set to False to reduce file size when waveforms are not needed.
+        :type save_waveforms: bool, optional
         """
         if path is None:
             path = self.path + '_processed.hdf5'
-        
+
         with h5py.File(path, 'w') as f:
             # Save configuration parameters as attributes
             f.attrs['path'] = self.path
@@ -1511,16 +1528,18 @@ class NanoDataset:
             f.attrs['verbose'] = self.verbose
             f.attrs['apply_notch'] = self.apply_notch
             f.attrs['ds_factor'] = self.ds_factor
-            
-            # Save config as a string if it's a path, or as None if it's a dict (can't serialize dicts easily)
+
+            # Serialize config: path strings stored directly; dicts serialized to JSON.
             if self.config is None:
                 f.attrs['config'] = ''
+                f.attrs['config_type'] = 'none'
             elif isinstance(self.config, (str, Path)):
                 f.attrs['config'] = str(self.config)
+                f.attrs['config_type'] = 'path'
             else:
-                # If it's a dict, we'll save it as a YAML string representation
-                # For now, mark it as a dict that can't be easily restored
-                f.attrs['config'] = '__dict__'
+                import json
+                f.attrs['config'] = json.dumps(self.config)
+                f.attrs['config_type'] = 'json'
             
             # Save file paths and indices as datasets
             if hasattr(self, 'file_paths') and len(self.file_paths) > 0:
@@ -1560,20 +1579,20 @@ class NanoDataset:
                 f.create_dataset('freqs', data=self.freqs, compression='gzip')
             
             # Optional attributes from load_calibration_data
-            if hasattr(self, 'pulses'):
+            if save_waveforms and hasattr(self, 'pulses'):
                 f.create_dataset('pulses', data=self.pulses, compression='gzip')
-            
+
             if hasattr(self, 'meters_per_volt'):
                 f.create_dataset('meters_per_volt', data=self.meters_per_volt, compression='gzip')
-            
+
             if hasattr(self, 'fit_success'):
                 f.create_dataset('fit_success', data=self.fit_success, compression='gzip')
-            
+
             if hasattr(self, 'pulse_amp_keV'):
                 f.attrs['pulse_amp_keV'] = self.pulse_amp_keV
-            
+
             # Optional attributes from load_search_data
-            if hasattr(self, 'deconvolved_pulses'):
+            if save_waveforms and hasattr(self, 'deconvolved_pulses'):
                 f.create_dataset('deconvolved_pulses', data=self.deconvolved_pulses, compression='gzip')
             
             if hasattr(self, 'impulse_rms'):
@@ -1591,13 +1610,14 @@ class NanoDataset:
         
     def load_from_hdf5(self, path=None, load_pulses=False):
         """Load a NanoDataset object from an HDF5 file.
-        
+
         Reinstantiates the object with all saved configuration parameters and data arrays.
         This is the inverse operation of save_to_hdf5.
-        
+
         :param path: path to the HDF5 file to load from. If None, uses self.path + '_processed.hdf5'
         :type path: str, optional
-        :param load_pulses: if True, load the deconvolved_pulses dataset (can be large). Default False.
+        :param load_pulses: if True, load the waveform arrays (``pulses`` and ``deconvolved_pulses``)
+            if they were saved. These can be large; set to False (default) to skip them.
         :type load_pulses: bool, optional
         """
         if path is None:
@@ -1619,11 +1639,14 @@ class NanoDataset:
             
             # Load config
             config_str = f.attrs['config'].decode('utf-8') if isinstance(f.attrs['config'], bytes) else f.attrs['config']
-            if config_str == '':
+            config_type = f.attrs.get('config_type', 'path')
+            if isinstance(config_type, bytes):
+                config_type = config_type.decode('utf-8')
+            if config_type == 'none' or config_str == '':
                 self.config = None
-            elif config_str == '__dict__':
-                # Config was a dict, can't restore it perfectly
-                self.config = None
+            elif config_type == 'json':
+                import json
+                self.config = json.loads(config_str)
             else:
                 self.config = config_str
             
@@ -1677,9 +1700,9 @@ class NanoDataset:
                 self.freqs = f['freqs'][:]
             
             # Optional attributes from load_calibration_data
-            if 'pulses' in f:
+            if load_pulses and 'pulses' in f:
                 self.pulses = f['pulses'][:]
-            
+
             if 'meters_per_volt' in f:
                 self.meters_per_volt = f['meters_per_volt'][:]
             
